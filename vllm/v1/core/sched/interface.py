@@ -156,3 +156,8 @@ class SchedulerInterface(ABC):
 
     def get_kv_connector(self) -> Optional["KVConnectorBase_V1"]:
         return None
+    
+    @abstractmethod
+    def get_rejected_requests(self) -> list["Request"]:
+        """Get the rejected requests in the scheduler's internal queue."""
+        return []

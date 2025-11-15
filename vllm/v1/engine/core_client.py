@@ -893,7 +893,10 @@ class AsyncMPClient(MPClient):
         await self._send_input_message(message, engine, args)
         self._ensure_output_queue_task()
         return await future
-
+    
+    async def get_load_statistics_async(self, t: float = 1) -> list[dict[str, Any]]:
+        return await self.call_utility_async("get_load_statistics", t)
+    
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         return await self.call_utility_async("get_supported_tasks")
 
@@ -954,7 +957,21 @@ class AsyncMPClient(MPClient):
             kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
         return await self.call_utility_async("collective_rpc", method, timeout,
                                              args, kwargs)
+    
+    async def update_config_async(self, config: dict, dp_rank: int = 0):
+        logger.info(f'updating config with {config} for dp_rank: {dp_rank}')
+        await self.call_utility_async("update_config", config, dp_rank)
+    
+    async def dump_profile_events(self, filename: str, dp_rank: int = 0):
+        return await self.call_utility_async("dump_profile_events", filename, dp_rank)
 
+    async def profile_step_async(self, request_json: dict) -> dict:
+        batch = request_json['batch']
+        n = request_json['n']
+        hz = request_json['hz']
+        verbose = request_json['verbose']
+        warmup = request_json['warmup']
+        return await self.call_utility_async("profile_step", batch, n, hz, warmup, verbose)
 
 class DPAsyncMPClient(AsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)

@@ -40,6 +40,39 @@ async def health() -> Response:
     return Response(status_code=200)
 
 
+@app.post("/dump_profile_events")
+async def dump_profile_events(request: Request) -> Response:
+    """Dump profile events to file."""
+    if engine is None:
+        return JSONResponse({"error": "Engine not initialized"}, status_code=500)
+    
+    try:
+        # Access the core engine through the engine hierarchy
+        # engine -> engine_core -> engine_core (EngineCore instance)
+        request_json = await request.json()
+        filename = request_json.get('filename', 'profile_events.jsonl')
+        if hasattr(engine, 'engine_core') and hasattr(engine.engine_core, 'engine_core'):
+            core_engine = engine.engine_core.engine_core
+            if hasattr(core_engine, 'dump_profile_events'):
+                core_engine.dump_profile_events(filename)
+                return JSONResponse({"message": "Profile events dumped successfully"})
+            else:
+                return JSONResponse({"error": "dump_profile_events method not found on core engine"}, status_code=500)
+        else:
+            return JSONResponse({"error": "Core engine not accessible"}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to dump profile events: {str(e)}"}, status_code=500)
+
+
+@app.post("/abort")
+async def abort(request: Request) -> Response:
+    """Abort the request.
+    """
+    request_dict = await request.json()
+    request_id = request_dict.get("request_id")
+    engine.abort(request_id)
+    return JSONResponse({"message": "Request aborted successfully"})
+
 @app.post("/generate")
 async def generate(request: Request) -> Response:
     """Generate completion for the request.

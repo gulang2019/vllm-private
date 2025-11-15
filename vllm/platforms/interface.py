@@ -280,7 +280,9 @@ class Platform:
         """
         Check if the current platform supports async output.
         """
-        raise NotImplementedError
+        print("WARNING: is_async_output_supported is not implemented for this platform")
+        return False
+        # raise NotImplementedError
 
     @classmethod
     def inference_mode(cls):

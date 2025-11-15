@@ -118,6 +118,8 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        
+        print('init kv cache manager, enable_caching: ', self.enable_caching)
 
     @property
     def usage(self) -> float:
@@ -179,6 +181,53 @@ class KVCacheManager:
 
         return KVCacheBlocks(computed_blocks), num_new_computed_tokens
 
+
+    def get_num_slots_to_allocate(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_computed_tokens: int = 0,
+        new_computed_blocks: Optional[KVCacheBlocks] = None,
+        num_lookahead_tokens: int = 0,
+    ) -> int:
+        if num_new_tokens == 0:
+            raise ValueError("num_new_tokens must be greater than 0")
+
+        if new_computed_blocks is not None:
+            new_computed_block_list = new_computed_blocks.blocks
+        else:
+            new_computed_block_list = tuple(
+                [] for _ in range(len(self.kv_cache_config.kv_cache_groups)))
+
+        # Free the blocks that are skipped during the attention computation
+        # (e.g., tokens outside the sliding window).
+        # We can do this even if we cannot schedule this request due to
+        # insufficient free blocks.
+        # Should call this function before allocating new blocks to reduce
+        # the number of evicted blocks.
+        self.coordinator.remove_skipped_blocks(request.request_id,
+                                               request.num_computed_tokens)
+
+        # The number of computed tokens is the number of computed tokens plus
+        # the new prefix caching hits
+        num_computed_tokens = (request.num_computed_tokens +
+                               num_new_computed_tokens)
+        num_tokens_need_slot = min(
+            num_computed_tokens + num_new_tokens + num_lookahead_tokens,
+            self.max_model_len)
+
+        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=num_tokens_need_slot,
+            new_computed_blocks=new_computed_block_list,
+        )
+
+        return num_blocks_to_allocate
+
+    def get_num_free_blocks(self) -> int:
+        """Get the number of free blocks."""
+        return self.block_pool.get_num_free_blocks()
+    
     def allocate_slots(
         self,
         request: Request,
@@ -232,6 +281,13 @@ class KVCacheManager:
             new_computed_block_list = tuple(
                 [] for _ in range(len(self.kv_cache_config.kv_cache_groups)))
 
+        # logger.info(f"request: {request}, type: {type(request)}")
+        # logger.info(f"num_new_tokens: {num_new_tokens}, type: {type(num_new_tokens)}")
+        # logger.info(f"num_new_computed_tokens: {num_new_computed_tokens}, type: {type(num_new_computed_tokens)}")
+        # logger.info(f"new_computed_blocks: {new_computed_blocks}, type: {type(new_computed_blocks)}")
+        # logger.info(f"num_lookahead_tokens: {num_lookahead_tokens}, type: {type(num_lookahead_tokens)}")
+        # logger.info(f"delay_cache_blocks: {delay_cache_blocks}, type: {type(delay_cache_blocks)}")
+        
         # Free the blocks that are skipped during the attention computation
         # (e.g., tokens outside the sliding window).
         # We can do this even if we cannot schedule this request due to
@@ -271,7 +327,7 @@ class KVCacheManager:
         # avoid the case where the new blocks cannot be allocated.
         self.coordinator.save_new_computed_blocks(request.request_id,
                                                   new_computed_block_list)
-
+        # logger.info(f"Allocating {num_tokens_need_slot} {type(num_tokens_need_slot)} blocks for request {request.request_id} {type(request.request_id)}")
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id, num_tokens_need_slot)
 
@@ -299,6 +355,10 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+
+    def get_num_freed_blocks_after_free(self, request: Request) -> int:
+        """Get the number of available blocks after freeing the request."""
+        return self.coordinator.get_num_freed_blocks_after_free(request.request_id)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF

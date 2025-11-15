@@ -18,7 +18,7 @@ from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
 # These are possible values of RequestOutput.finish_reason,
 # so form part of the external API.
-FINISH_REASON_STRINGS = ("stop", "length", "abort")
+FINISH_REASON_STRINGS = ("stop", "length", "abort", "rejected")
 
 
 class FinishReason(enum.IntEnum):
@@ -30,11 +30,12 @@ class FinishReason(enum.IntEnum):
     stop - a stop string was emitted
     length - max_tokens was consumed, or max_model_len was reached
     abort - aborted for another reason
-
+    rejected - rejected for another reason
     """
     STOP = 0
     LENGTH = 1
     ABORT = 2
+    REJECTED = 3
 
     def __str__(self):
         return FINISH_REASON_STRINGS[self.value]
@@ -75,6 +76,8 @@ class EngineCoreEventType(enum.IntEnum):
     QUEUED = 1
     SCHEDULED = 2
     PREEMPTED = 3
+    REJECTED = 4
+    RESUMED = 5
 
 
 class EngineCoreEvent(msgspec.Struct):

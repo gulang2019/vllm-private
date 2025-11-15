@@ -37,7 +37,7 @@ class Request:
         lora_request: Optional["LoRARequest"] = None,
         structured_output_request: Optional["StructuredOutputRequest"] = None,
         cache_salt: Optional[str] = None,
-        priority: int = 0,
+        priority: float = 0,
         block_hasher: Optional[Callable[["Request"],
                                         list["BlockHash"]]] = None,
     ) -> None:
@@ -120,6 +120,8 @@ class Request:
         if block_hasher is not None:
             self.get_hash_new_full_blocks = partial(block_hasher, self)
             self.block_hashes = self.get_hash_new_full_blocks()
+            
+        self.scheduled = False
 
     @classmethod
     def from_engine_core_request(
@@ -206,6 +208,34 @@ class Request:
             return None
         events, self.events = self.events, []
         return events
+    
+    @property
+    def prefill_ddl(self) -> float:
+        # return self.sampling_params.extra_args.get('prefill_ddl', 
+        #     self.sampling_params.extra_args['slo_ttft'] + self.arrival_time)
+        return self.sampling_params.extra_args['slo_ttft'] + self.arrival_time
+    
+    def __str__(self):
+        # String representation containing all relevant state of the request.
+        fields = [
+            f"request_id={getattr(self, 'request_id', None)}",
+            f"status={getattr(self, 'status', None)}",
+            f"priority={getattr(self, 'priority', None)}",
+            f"arrival_time={getattr(self, 'arrival_time', None)}",
+            f"stop_reason={getattr(self, 'stop_reason', None)}",
+            f"num_tokens={self.num_tokens}",
+            f"num_output_tokens={self.num_output_tokens}",
+            f"num_computed_tokens={getattr(self, 'num_computed_tokens', None)}",
+            f"num_prompt_tokens={getattr(self, 'num_prompt_tokens', None)}",
+            f"max_tokens={getattr(self, 'max_tokens', None)}",
+            f"kv_transfer_params={getattr(self, 'kv_transfer_params', None)}",
+            f"sampling_params={getattr(self, 'sampling_params', None)}",
+            f"is_output_corrupted={self.is_output_corrupted}",
+            f"events={getattr(self, 'events', [])}",
+            f"#block_hashes={len(getattr(self, 'block_hashes', []))}",
+        ]
+        fields_str = ',\n'.join(fields)
+        return f"<Request {fields_str}>"
 
 
 class RequestStatus(enum.IntEnum):
@@ -221,6 +251,7 @@ class RequestStatus(enum.IntEnum):
     FINISHED_LENGTH_CAPPED = enum.auto()
     FINISHED_ABORTED = enum.auto()
     FINISHED_IGNORED = enum.auto()
+    FINISHED_REJECTED = enum.auto()
 
     def __str__(self):
         return self.name
@@ -244,4 +275,5 @@ _FINISHED_REASON_MAP = {
     RequestStatus.FINISHED_LENGTH_CAPPED: FinishReason.LENGTH,
     RequestStatus.FINISHED_ABORTED: FinishReason.ABORT,
     RequestStatus.FINISHED_IGNORED: FinishReason.LENGTH,
+    RequestStatus.FINISHED_REJECTED: FinishReason.REJECTED,
 }

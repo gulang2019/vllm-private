@@ -476,6 +476,30 @@ async def ping(raw_request: Request) -> Response:
     """Ping check. Endpoint required for SageMaker"""
     return await health(raw_request)
 
+@router.post("/dump_profile_events")
+async def dump_profile_events(raw_request: Request):
+    logger.info("Dumping profile events...")
+    request_json = await raw_request.json()
+    filename = request_json.get('filename', 'profile_events.jsonl')
+    try:
+        await engine_client(raw_request).dump_profile_events(filename)
+        logger.info("Profile events dumped successfully.")
+        return JSONResponse({"message": "Profile events dumped successfully"})
+    except Exception as e:
+        logger.error(f"Failed to dump profile events: {e}")
+        return JSONResponse({"error": f"Failed to dump profile events: {str(e)}"}, status_code=500)
+
+@router.post("/update_config")
+async def update_config(raw_request: Request):
+    request_json = await raw_request.json()
+    await engine_client(raw_request).update_config(request_json)
+    return JSONResponse({"message": "Config updated."})
+
+@router.post("/profile_step")
+async def profile_step(raw_request: Request):
+    request_json = await raw_request.json()
+    profile_dict = await engine_client(raw_request).profile_step(request_json)
+    return JSONResponse(content=profile_dict)
 
 @router.post("/tokenize",
              dependencies=[Depends(validate_json_request)],
@@ -1266,7 +1290,6 @@ if envs.VLLM_TORCH_PROFILER_DIR:
         await engine_client(raw_request).stop_profile()
         logger.info("Profiler stopped.")
         return Response(status_code=200)
-
 
 if envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING:
     logger.warning(

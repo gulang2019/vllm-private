@@ -1914,11 +1914,15 @@ class DeviceConfig:
             # Automated device type detection
             from vllm.platforms import current_platform
             self.device_type = current_platform.device_type
+            # print(f"Device type: {self.device_type}")
             if not self.device_type:
-                raise RuntimeError(
-                    "Failed to infer device type, please set "
+                print("Failed to infer device type, please set "
                     "the environment variable `VLLM_LOGGING_LEVEL=DEBUG` "
                     "to turn on verbose logging to help debug the issue.")
+                # raise RuntimeError(
+                #     "Failed to infer device type, please set "
+                #     "the environment variable `VLLM_LOGGING_LEVEL=DEBUG` "
+                #     "to turn on verbose logging to help debug the issue.")
         else:
             # Device type is assigned explicitly
             if isinstance(self.device, str):
@@ -1931,6 +1935,8 @@ class DeviceConfig:
             self.device = torch.device("cpu")
         elif self.device_type in ["tpu"]:
             self.device = None
+        elif not self.device_type:
+            self.device_type = None
         else:
             # Set device with device type
             self.device = torch.device(self.device_type)
@@ -3399,6 +3405,12 @@ class VllmConfig:
     """The configurations for distributed KV cache transfer."""
     kv_events_config: Optional[KVEventsConfig] = None
     """The configurations for event publishing."""
+    
+    # Dummy prefill configuration
+    dummy_prefill: bool = False
+    """Enable dummy prefill mode. When True, the server will skip actual prefill computation
+    and just allocate KV cache blocks, similar to KV transfer mode."""
+    
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.
@@ -3408,6 +3420,9 @@ class VllmConfig:
     you are using. Contents must be hashable."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
+    
+    is_simulation: None | str = None
+    """Whether to run in simulation mode."""
 
     def compute_hash(self) -> str:
         """

@@ -12,6 +12,8 @@ from contextlib import ExitStack, contextmanager
 from inspect import isclass, signature
 from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
+from collections import defaultdict
+import json
 
 import msgspec
 import zmq
@@ -34,7 +36,8 @@ from vllm.v1.core.kv_cache_utils import (BlockHash, get_kv_cache_config,
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as V1Scheduler
-from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
+# from vllm.v1.core.sched.scheduler_adm_ctrl import SchedulerAdmCtrl as V1Scheduler
+from vllm.v1.engine import (EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
                             EngineCoreRequestType,
                             ReconfigureDistributedRequest, ReconfigureRankType,
                             UtilityOutput, UtilityResult)
@@ -101,6 +104,8 @@ class EngineCore:
                 vllm_config.scheduler_config.scheduler_cls)
         else:
             Scheduler = vllm_config.scheduler_config.scheduler_cls
+        
+        logger.info(f"Scheduler: {Scheduler}")
 
         # This warning can be removed once the V1 Scheduler interface is
         # finalized and we can maintain support for scheduler classes that
@@ -155,6 +160,11 @@ class EngineCore:
 
             self.request_block_hasher = get_request_block_hasher(
                 block_size, caching_hash_fn)
+        
+        self._profile_events = []
+        # Hacking to get the profile events into the scheduler
+        self.scheduler._profile_events = self._profile_events
+        self.batch_id = 0
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -225,6 +235,7 @@ class EngineCore:
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
+        start_time = time.time()
         # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(
@@ -244,8 +255,45 @@ class EngineCore:
                 not self.scheduler.get_kv_connector()):
             logger.warning("Got kv_transfer_params, but no KVConnector found. "
                            "Disabling KVTransfer for this request.")
-
-        self.scheduler.add_request(request)
+        if request.kv_transfer_params is not None:
+            prefill_only = request.kv_transfer_params.get('do_remote_decode', False)
+            decode_only = request.kv_transfer_params.get('do_remote_prefill', False)
+        else:
+            prefill_only = False
+            decode_only = False
+            
+        
+        self._profile_events.append({
+            "event_type": "arrival",
+            "zero_load_ttft": request.sampling_params.extra_args.get('zero_load_ttft', 0),
+            "request_id": request.request_id,
+            "prompt_tokens": request.num_prompt_tokens,
+            "max_tokens": request.max_tokens,
+            "timestamp": time.time(),
+            "prefill_ddl": request.prefill_ddl,
+            "profit": request.sampling_params.extra_args.get('profit', 1),
+            "prefill_only": prefill_only,
+            "decode_only": decode_only,
+            "add_req_time": request.arrival_time,
+        })
+        
+        
+        suc = self.scheduler.add_request(request)
+        scheduler_overhead = time.time() - start_time
+        if not suc:
+            request.status = RequestStatus.FINISHED_REJECTED
+            self.output_queue.put_nowait((request.client_index, EngineCoreOutputs(outputs=[
+                EngineCoreOutput(request_id=request.request_id, 
+                                 new_token_ids=[], 
+                                 finish_reason=request.get_finished_reason())],
+                        finished_requests={request.request_id})))
+            self._profile_events.append({
+                "event_type": "finish",
+                "request_id": request.request_id,
+                "timestamp": time.time(),
+                "finish_reason": "rejected-arrival",
+                "scheduling_overhead": scheduler_overhead,
+            })
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -274,6 +322,110 @@ class EngineCore:
                                   self.scheduler.make_stats())
             raise err
 
+    def profile_step(
+        self,
+        batch: list[tuple[int, int]],
+        n: int,
+        hz: int = 100,
+        warmup: int = 10, 
+        verbose: bool = False,
+    ):
+        '''
+        batch: list of (past_seq_len, current_seq_len), 
+        n: num of repeats
+        '''
+        from vllm.v1.request import Request
+        import uuid 
+        import random 
+        import time 
+        import numpy as np
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput, CachedRequestData
+        new_reqs_data = []
+        
+        num_scheduled_tokens = {}
+        initial_requests = []
+        for past_seq_len, cur_seq_len in batch:
+            
+            request = Request(
+                request_id = str(uuid.uuid4()),
+                prompt_token_ids = [random.randint(1000, 2000) for _ in range(past_seq_len + cur_seq_len)],
+                multi_modal_kwargs = None,
+                multi_modal_hashes = None,
+                multi_modal_placeholders = None,
+                sampling_params = SamplingParams(),
+                pooling_params = None,
+                eos_token_id = None,
+                client_index = 0,
+                block_hasher = self.request_block_hasher
+            )
+            blocks = self.scheduler.kv_cache_manager.allocate_slots(
+                request, 
+                cur_seq_len + past_seq_len 
+            )
+            
+            request.num_computed_tokens = past_seq_len
+            num_scheduled_tokens[request.request_id] = cur_seq_len
+            new_reqs_data.append(NewRequestData.from_request(
+                request, blocks.get_block_ids()))
+            initial_requests.append(request)
+        metadata = SchedulerOutput(
+            scheduled_new_reqs=new_reqs_data,
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=sum(list(num_scheduled_tokens.values())),
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[0] * len(
+            self.scheduler.kv_cache_config.kv_cache_groups),
+            finished_req_ids = set(), 
+            free_encoder_input_ids = [],
+            structured_output_request_ids = {},
+            grammar_bitmask = None,
+        )
+        
+        for _ in range(warmup):        
+            model_output = self.model_executor.execute_model(metadata)
+            metadata.finished_req_ids = set(metadata.num_scheduled_tokens.keys())                
+            num_scheduled_tokens = {}
+            for sch in metadata.scheduled_new_reqs:
+                new_req_id = str(uuid.uuid4())
+                num_scheduled_tokens[new_req_id] = metadata.num_scheduled_tokens[sch.req_id]
+                sch.req_id = new_req_id            
+            metadata.num_scheduled_tokens = num_scheduled_tokens    
+        
+        start_time = time.time()
+        from motivation.energy_measure import EnergyMeter
+        times = []
+        with EnergyMeter(sample_hz=hz) as meter:
+            for _ in range(n):        
+                start_time = time.time()
+                model_output = self.model_executor.execute_model(metadata)
+                metadata.finished_req_ids = set(metadata.num_scheduled_tokens.keys())                
+                num_scheduled_tokens = {}
+                for sch in metadata.scheduled_new_reqs:
+                    new_req_id = str(uuid.uuid4())
+                    num_scheduled_tokens[new_req_id] = metadata.num_scheduled_tokens[sch.req_id]
+                    sch.req_id = new_req_id
+                
+                metadata.num_scheduled_tokens = num_scheduled_tokens    
+                times.append(time.time() - start_time)
+        per_gpu_joules, energy = meter.read()
+        energy /= n
+        
+        for req in initial_requests:
+            self.scheduler.kv_cache_manager.free(req)
+        # for elapsed and energy report mean, std, p20, p50, p80, p90, p99
+        if verbose: 
+            report = lambda data, label: print(f'{label}: MEAN: {np.mean(data)}, STD: {np.std(data)}, P20: {np.percentile(data, 20)}, P50: {np.percentile(data, 50)}, P80: {np.percentile(data, 80)}, P90: {np.percentile(data, 90)}, P99: {np.percentile(data, 99)}')
+            print(f'Profile on batch of size {len(batch)}, example: {batch[:5]}.')
+            report(times, "Time")
+            print(f'Energy: {energy} J')
+        return {
+            "time": sum(times) / n,
+            "energy": energy,
+        }
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -285,15 +437,106 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        start = time.time()
+        self.batch_id += 1
+        self.scheduler.batch_id = self.batch_id
         scheduler_output = self.scheduler.schedule()
-        model_output = self.execute_model_with_error_logging(
-            self.model_executor.execute_model,  # type: ignore
-            scheduler_output)
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output)  # type: ignore
+        scheduling_overhead = time.time() - start
+        
+        rejected_outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        for req in self.scheduler.get_rejected_requests():
+            self._profile_events.append({
+                "event_type": "finish",
+                "request_id": req.request_id,
+                "timestamp": time.time(),
+                "finish_reason": "rejected",
+                "scheduling_overhead": scheduling_overhead,
+            })
 
+            rejected_outputs[req.client_index].append(EngineCoreOutput(
+                request_id=req.request_id,
+                new_token_ids=[],
+                finish_reason=req.get_finished_reason(),
+            ))
+        
+        outputs = {client_index: EngineCoreOutputs(
+            outputs=outs, finished_requests=set([out.request_id for out in outs])) for client_index, outs in rejected_outputs.items()}
+            
+        for output in (outputs.items() if outputs else ()):
+            self.output_queue.put_nowait(output)
+
+        # print(f"Schedule[{self._timestamp[0]}]: {scheduler_output}")
+        try:
+            model_output = self.execute_model_with_error_logging(
+                self.model_executor.execute_model,  # type: ignore
+                scheduler_output)
+        except Exception as e:
+            self.dump_profile_events(f'engine_core_{self.vllm_config.parallel_config.data_parallel_rank}.events.jsonl')
+            logger.error(f"Exception in execute_model_with_error_logging: {e}", exc_info=True)
+            raise e
+        elasped = time.time() - start
+        
+        
+        self._profile_events.append({
+            "event_type": "batch",
+            "batch_id": self.batch_id,
+            "timestamp": time.time(),
+            "elapsed": elasped,
+            "req_ids": [new_req.req_id for new_req in scheduler_output.scheduled_new_reqs] + scheduler_output.scheduled_cached_reqs.req_ids,
+            "num_computed_tokens": [new_req.num_computed_tokens for new_req in scheduler_output.scheduled_new_reqs] + scheduler_output.scheduled_cached_reqs.num_computed_tokens,
+            "num_scheduled_tokens": scheduler_output.num_scheduled_tokens,
+            "scheduling_overhead": scheduling_overhead,
+        })
+        
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output, elapsed_time=elasped)  # type: ignore
+        
+        for output in engine_core_outputs.values():
+            for req_output in output.outputs:
+                if req_output.finish_reason is not None:
+                    
+                    self._profile_events.append({
+                        "event_type": "finish",
+                        "request_id": req_output.request_id,
+                        "timestamp": time.time(),
+                        "finish_reason": str(req_output.finish_reason),
+                    })
+                
         return (engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0)
+
+    def dump_profile_events(self, filename: str, dp_rank: int = 0):
+        if self.vllm_config.parallel_config.data_parallel_rank != dp_rank:
+            return
+        logger.info(f'[DP{dp_rank}] dumping profile events to {filename}')
+        if hasattr(self.scheduler, '_req_cached_tokens'):
+            for event in self._profile_events:
+                if event['event_type'] == 'arrival':
+                    event['num_cached_tokens'] = self.scheduler._req_cached_tokens.get(event['request_id'], 0)
+            
+        with open(filename, 'w') as f:
+            json.dump(self._profile_events, f, indent=4)
+        logger.info(f'Saved {len(self._profile_events)} events to {filename}')
+        self._profile_events.clear()
+        
+    def update_config(self, config: dict, dp_rank: int = 0):
+        if self.vllm_config.parallel_config.data_parallel_rank != dp_rank:
+            return
+        logger.info(f'[DP{dp_rank}] updating config with {config}')
+        
+        self._profile_events = []
+        for k, v in config.items():
+            if isinstance(v, dict):
+                for kk, vv in v.items():
+                    if hasattr(self.scheduler.scheduler_config, kk):
+                        setattr(self.scheduler.scheduler_config, kk, vv)
+            elif hasattr(self.scheduler.scheduler_config, k):
+                setattr(self.scheduler.scheduler_config, k, v)
+        logger.info(f'Scheduler config updated: {self.scheduler.scheduler_config}')
+        self.scheduler.reset(self._profile_events)
+        
+    def get_load_statistics(self, t: float = 1) -> list[dict[str, Any]]:
+        return self.scheduler.get_load_statistics(t)
 
     def post_step(self, model_executed: bool) -> None:
         if self.use_spec_decode and model_executed:
@@ -723,28 +966,61 @@ class EngineCoreProc(EngineCore):
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
             # 1) Poll the input queue until there is work to do.
+            start_time = time.time()
+            n_requests = self.input_queue.qsize()
+
             self._process_input_queue()
+            if n_requests > 0:
+                self._profile_events.append({
+                    "event_type": "process_input", 
+                    "timestamp": start_time,
+                    "elapsed": time.time() - start_time,
+                    "num_requests": n_requests,
+                })
+            start_time = time.time()
+
             # 2) Step the engine core and return the outputs.
             self._process_engine_step()
 
-    def _process_input_queue(self):
-        """Exits when an engine step needs to be performed."""
-
-        waited = False
-        while not self.engines_running and not self.scheduler.has_requests():
-            if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
-                logger.debug("EngineCore waiting for work.")
-                waited = True
-            req = self.input_queue.get()
+            if n_requests > 0:
+                self._profile_events.append({
+                    "event_type": "engine_step", 
+                    "timestamp": start_time,
+                    "elapsed": time.time() - start_time,
+                    "num_requests": n_requests,
+                })
+    
+    def _process_input_queue(self, *, max_items=64, max_time_ms=5):
+        start = time.perf_counter()
+        handled = 0
+        while handled < max_items:
+            try:
+                req = self.input_queue.get_nowait()
+            except queue.Empty:
+                break
             self._handle_client_request(*req)
+            handled += 1
+            if (time.perf_counter() - start) * 1e3 > max_time_ms:
+                break
+    
+    # def _process_input_queue(self):
+    #     """Exits when an engine step needs to be performed."""
 
-        if waited:
-            logger.debug("EngineCore loop active.")
+    #     # waited = False
+    #     # while not self.engines_running and not self.scheduler.has_requests():
+    #     #     if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
+    #     #         logger.debug("EngineCore waiting for work.")
+    #     #         waited = True
+    #     #     req = self.input_queue.get()
+    #     #     self._handle_client_request(*req)
 
-        # Handle any more client requests.
-        while not self.input_queue.empty():
-            req = self.input_queue.get_nowait()
-            self._handle_client_request(*req)
+    #     # if waited:
+    #         # logger.debug("EngineCore loop active.")
+
+    #     # Handle any more client requests.
+    #     while not self.input_queue.empty():
+    #         req = self.input_queue.get_nowait()
+    #         self._handle_client_request(*req)
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""

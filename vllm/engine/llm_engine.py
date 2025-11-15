@@ -10,7 +10,7 @@ from functools import partial
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Deque, Dict,
                     Iterable, List, Literal, Mapping, NamedTuple, Optional)
 from typing import Sequence as GenericSequence
-from typing import Set, Type, Union, cast
+from typing import Set, Type, Union, cast, Tuple
 
 import torch
 from typing_extensions import TypeVar
@@ -706,6 +706,7 @@ class LLMEngine:
             lora_request=lora_request,
             trace_headers=trace_headers,
             priority=priority,
+
         )
 
     def _create_sequence_group_with_sampling(
@@ -1880,6 +1881,126 @@ class LLMEngine:
                 sampling_params.logits_processors.extend(logits_processors)
 
         return sampling_params
+
+    # Profiling methods for API server access
+    def get_profiling_data(self) -> List[Tuple[List[int], List[int], float]]:
+        """
+        Get all collected profiling data from the model executor.
+        
+        Returns:
+            List of (context_lengths, current_lengths, execution_time) tuples
+        """
+        try:
+            return self.model_executor.collective_rpc("get_profiling_data", timeout=10.0)
+        except Exception as e:
+            logger.warning(f"Failed to get profiling data: {e}")
+            return []
+    
+    def clear_profiling_data(self) -> bool:
+        """
+        Clear all collected profiling data from the model executor.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            results = self.model_executor.collective_rpc("clear_profiling_data", timeout=10.0)
+            return all(results)
+        except Exception as e:
+            logger.warning(f"Failed to clear profiling data: {e}")
+            return False
+    
+    def export_profiling_data(self, filename: str = None) -> str:
+        """
+        Export profiling data to JSON file from the model executor.
+        
+        Args:
+            filename: Optional filename, defaults to profiler's output file
+            
+        Returns:
+            Path to saved JSON file
+        """
+        try:
+            results = self.model_executor.collective_rpc("export_profiling_data", timeout=10.0, args=(filename,))
+            # Return the first successful result
+            for result in results:
+                if result:
+                    return result
+            return ""
+        except Exception as e:
+            logger.warning(f"Failed to export profiling data: {e}")
+            return ""
+    
+    def export_profiling_csv(self, filename: str = None) -> str:
+        """
+        Export profiling data to CSV file from the model executor.
+        
+        Args:
+            filename: Optional filename, defaults to profiler's output file with .csv extension
+            
+        Returns:
+            Path to saved CSV file
+        """
+        try:
+            results = self.model_executor.collective_rpc("export_profiling_csv", timeout=10.0, args=(filename,))
+            # Return the first successful result
+            for result in results:
+                if result:
+                    return result
+            return ""
+        except Exception as e:
+            logger.warning(f"Failed to export profiling CSV: {e}")
+            return ""
+    
+    def get_profiling_summary(self) -> Dict[str, Any]:
+        """
+        Get profiling summary statistics from the model executor.
+        
+        Returns:
+            Dictionary with summary statistics
+        """
+        try:
+            results = self.model_executor.collective_rpc("get_profiling_summary", timeout=10.0)
+            # Merge results from all workers
+            merged_summary = {}
+            for result in results:
+                if result:
+                    for key, value in result.items():
+                        if key == "total_samples":
+                            merged_summary[key] = merged_summary.get(key, 0) + value
+                        elif key == "avg_execution_time":
+                            # Calculate weighted average
+                            if "total_samples" in merged_summary:
+                                merged_summary[key] = (
+                                    (merged_summary.get(key, 0) * merged_summary["total_samples"] + 
+                                     value * result.get("total_samples", 0)) / 
+                                    (merged_summary["total_samples"] + result.get("total_samples", 0))
+                                )
+                        else:
+                            merged_summary[key] = value
+            return merged_summary
+        except Exception as e:
+            logger.warning(f"Failed to get profiling summary: {e}")
+            return {}
+    
+    def get_profiling_status(self) -> Dict[str, Any]:
+        """
+        Get profiling system status and configuration from the model executor.
+        
+        Returns:
+            Dictionary with profiling status information
+        """
+        try:
+            results = self.model_executor.collective_rpc("get_profiling_status", timeout=10.0)
+            # Return the first result that shows profiler is active
+            for result in results:
+                if result and result.get("profiler_active", False):
+                    return result
+            # If no active profiler found, return the first result
+            return results[0] if results else {"profiler_active": False}
+        except Exception as e:
+            logger.warning(f"Failed to get profiling status: {e}")
+            return {"profiler_active": False, "error": str(e)}
 
     def collective_rpc(self,
                        method: Union[str, Callable[..., _R]],

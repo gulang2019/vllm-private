@@ -720,7 +720,8 @@ class SequenceGroup:
                  encoder_seq: Optional[Sequence] = None,
                  trace_headers: Optional[Mapping[str, str]] = None,
                  priority: int = 0,
-                 draft_size: int = 1) -> None:
+                 draft_size: int = 1,
+                 ) -> None:
         self.request_id = request_id
         self.seqs = seqs
         self.first_seq = seqs[0]
@@ -743,6 +744,7 @@ class SequenceGroup:
         self.encoder_seq = encoder_seq
         self.trace_headers = trace_headers
         self.priority = priority
+
 
         self.cached_request_output = None
 
@@ -964,6 +966,8 @@ class SequenceGroupMetadata(
                            (SequenceGroup.encoder_seq). Should be None
                            unless you are working with an encoder/decoder
                            model.
+        dummy_prefill: Whether this is a dummy prefill request that should
+                       allocate KV cache without performing actual computation.
     """
 
     request_id: str
@@ -983,6 +987,7 @@ class SequenceGroupMetadata(
     encoder_seq_data: Optional[SequenceData] = None
     cross_block_table: Optional[list[int]] = None
     token_chunk_size: Optional[int] = None
+
 
     ### Stateful fields that are lazily defined. ###
     # The number of speculative tokens adopted in this request.

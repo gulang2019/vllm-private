@@ -7,6 +7,7 @@ import copy
 import dataclasses
 import functools
 import json
+import os
 import sys
 from dataclasses import MISSING, dataclass, fields, is_dataclass
 from itertools import permutations
@@ -447,6 +448,12 @@ class EngineArgs:
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
 
+    # Dummy prefill configuration
+    dummy_prefill: bool = False
+    """Enable dummy prefill mode. When True, the server will skip actual prefill computation
+    and just allocate KV cache blocks, similar to KV transfer mode. This is useful for
+    performance profiling and testing KV cache allocation without model computation."""
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -457,6 +464,12 @@ class EngineArgs:
         if isinstance(self.eplb_config, dict):
             self.eplb_config = EPLBConfig.from_cli(json.dumps(
                 self.eplb_config))
+        
+        # Check for dummy prefill environment variable
+        if os.environ.get("USE_DUMMY_PREFILL", "0") == "1":
+            self.dummy_prefill = True
+            logger.info("USE_DUMMY_PREFILL=1 detected, enabling dummy prefill mode")
+        
         # Setup plugins
         from vllm.plugins import load_general_plugins
         load_general_plugins()
@@ -888,6 +901,11 @@ class EngineArgs:
         parser.add_argument('--disable-log-stats',
                             action='store_true',
                             help='Disable logging statistics.')
+        parser.add_argument('--dummy-prefill',
+                            action='store_true',
+                            help='Enable dummy prefill mode. When True, the server will skip actual prefill computation '
+                                 'and just allocate KV cache blocks, similar to KV transfer mode. This is useful for '
+                                 'performance profiling and testing KV cache allocation without model computation.')
 
         return parser
 
@@ -1395,6 +1413,7 @@ class EngineArgs:
             compilation_config=self.compilation_config,
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
+            dummy_prefill=self.dummy_prefill,
             additional_config=self.additional_config,
         )
 

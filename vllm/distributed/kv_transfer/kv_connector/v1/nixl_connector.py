@@ -46,10 +46,16 @@ ReqId = str
 GET_META_MSG = b"get_meta_msg"
 
 logger = init_logger(__name__)
+logger.setLevel(logging.DEBUG)
 
 # Lazy import nixl_wrapper to avoid loading nixl_bindings if nixl is not used
 try:
+    import os
     from nixl._api import nixl_agent as NixlWrapper
+    os.environ['UCX_TLS'] = 'cuda_ipc,cuda_copy,tcp,self,sm'
+    os.environ['UCX_NET_DEVICES'] = 'lo'
+    os.environ['UCX_SOCKADDR_TLS_PRIORITY'] = 'sockcm'
+    os.environ['UCX_WARN_UNUSED_ENV_VARS'] = 'n'
     logger.info("NIXL is available")
 except ImportError:
     logger.warning("NIXL is not available")
@@ -125,6 +131,7 @@ class NixlConnector(KVConnectorBase_V1):
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
+        logger.info(f"NixlConnector[__init__]: engine_id={self.engine_id}")
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: Optional[NixlConnectorScheduler] = \
@@ -177,13 +184,16 @@ class NixlConnector(KVConnectorBase_V1):
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         assert self.connector_scheduler is not None
-        return self.connector_scheduler.build_connector_meta(scheduler_output)
-
+        meta = self.connector_scheduler.build_connector_meta(scheduler_output)
+        logger.debug(f"NixlConnector[build_connector_meta]: meta={meta}")
+        return meta 
+    
     def request_finished(
         self,
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
+        logger.debug(f"NixlConnector[request_finished]: request={request}, block_ids={block_ids}")
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
@@ -241,6 +251,7 @@ class NixlConnectorScheduler:
             vllm_config.parallel_config.tensor_parallel_size)
         self.use_host_buffer = \
             vllm_config.kv_transfer_config.kv_buffer_device == "cpu"
+        assert not self.use_host_buffer
         logger.info("Initializing NIXL Scheduler %s", engine_id)
 
         # Requests that need to start recv/send.
@@ -1082,6 +1093,7 @@ class NixlConnectorWorker:
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+        logger.debug(f"NixlConnector[start_load_kv]: metadata={metadata}")
         for req_id, meta in metadata.reqs_to_recv.items():
             remote_engine_id = meta.remote_engine_id
             logger.debug(

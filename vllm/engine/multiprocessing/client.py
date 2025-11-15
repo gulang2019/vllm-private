@@ -603,6 +603,20 @@ class MQLLMEngineClient(EngineClient):
         await self._send_one_way_rpc_request(
             request=RPCUProfileRequest.STOP_PROFILE, socket=self.input_socket)
 
+    async def dump_profile_events(self, filename: str, dp_rank: int = 0) -> None:
+        """Dump profile events to file"""
+        # For multiprocessing, we need to send an RPC request
+        # This would need to be implemented in the engine process
+        raise NotImplementedError("dump_profile_events not yet implemented for multiprocessing mode")
+
+    async def update_config(self, config: dict, dp_rank: int = 0):
+        """Update the config"""
+        raise NotImplementedError("update_config not yet implemented for multiprocessing mode")
+
+    async def profile_step(self, request_json: dict) -> dict:
+        """Profile a step"""
+        raise NotImplementedError("profile_step not yet implemented for multiprocessing mode")
+
     async def reset_mm_cache(self) -> None:
         """Reset the multi-modal cache"""
 

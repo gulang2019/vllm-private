@@ -294,6 +294,21 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def dump_profile_events(self, filename: str, dp_rank: int = 0) -> None:
+        """Dump profile events to file"""
+        ...
+    
+    @abstractmethod
+    async def update_config(self, config: dict, dp_rank: int = 0) -> None:
+        """Update the config"""
+        ...
+        
+    @abstractmethod
+    async def profile_step(self, config: dict) -> dict:
+        """Profile a step"""
+        ...
+
+    @abstractmethod
     async def reset_mm_cache(self) -> None:
         """Reset the multi-modal cache"""
         ...

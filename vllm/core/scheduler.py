@@ -1715,7 +1715,10 @@ class Scheduler:
             self._async_stopped.clear()
 
     def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:
+        # Allocate KV cache blocks for the sequence group
         self.block_manager.allocate(seq_group)
+        
+        # Normal prefill handling
         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
             seq.status = SequenceStatus.RUNNING
 

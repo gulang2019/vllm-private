@@ -165,6 +165,12 @@ class SingleTypeKVCacheManager(ABC):
 
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
+    
+    def get_num_freed_blocks_after_free(self, request_id: str) -> int:
+        """Get the number of available blocks after freeing the request."""
+        req_blocks = self.req_to_blocks.get(request_id, [])
+        ordered_blocks = reversed(req_blocks)
+        return self.block_pool.get_num_freed_blocks_after_free(ordered_blocks)
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, request_id: str,

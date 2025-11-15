@@ -42,6 +42,14 @@ class KVCacheCoordinator(ABC):
             ) for i, kv_cache_group in enumerate(
                 self.kv_cache_config.kv_cache_groups))
 
+    def get_num_freed_blocks_after_free(self, request_id: str) -> int:
+        """Get the number of available blocks after freeing the request."""
+        for manager in self.single_type_managers:
+            if request_id in manager.req_to_blocks:
+                return manager.get_num_freed_blocks_after_free(request_id)
+        return 0
+    
+
     def get_num_blocks_to_allocate(
             self, request_id: str, num_tokens: int,
             new_computed_blocks: tuple[list[KVCacheBlock], ...]) -> int:

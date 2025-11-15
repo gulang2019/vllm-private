@@ -81,7 +81,7 @@ class P2pNcclEngine:
         self.nccl = NCCLLibrary(library_path)
 
         if not hostname:
-            hostname = get_ip()
+            hostname = "0.0.0.0" #get_ip()
         port = int(self.config.kv_port) + port_offset
         if port == 0:
             raise ValueError("Port cannot be 0")
@@ -166,9 +166,14 @@ class P2pNcclEngine:
         logger.info(
             "💯P2pNcclEngine init, rank:%d, local_rank:%d, http_address:%s, "
             "zmq_address:%s, proxy_address:%s, send_type:%s, buffer_size_"
-            "threshold:%.2f, nccl_num_channels:%s", self.rank, self.local_rank,
+            "threshold:%.2f, nccl_num_channels:%s, port_offset:%d", self.rank, self.local_rank,
             self.http_address, self.zmq_address, self.proxy_address,
-            self.send_type, self.buffer_size_threshold, self.nccl_num_channels)
+            self.send_type, self.buffer_size_threshold, self.nccl_num_channels, port_offset)
+        
+        # To traceback the callstack at this point, you can log or print the current stack.
+        # This is useful for debugging to see how this code path was reached.
+        import traceback
+        logger.info("Callstack:\n%s", "".join(traceback.format_stack()))
 
     def create_connect(self, remote_address: typing.Optional[str] = None):
         assert remote_address is not None
@@ -505,7 +510,7 @@ class P2pNcclEngine:
     def ping(self):
         sock = self.context.socket(zmq.DEALER)
         sock.setsockopt_string(zmq.IDENTITY, self.zmq_address)
-        logger.debug("ping start, zmq_address:%s", self.zmq_address)
+        logger.info("ping start, zmq_address:%s, proxy_address:%s, http_address:%s", self.zmq_address, self.proxy_address, self.http_address)
         sock.connect(f"tcp://{self.proxy_address}")
         data = {
             "type": "P" if self.config.is_kv_producer else "D",

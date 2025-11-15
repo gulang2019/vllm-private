@@ -49,6 +49,7 @@ class Scheduler(SchedulerInterface):
         include_finished_set: bool = False,
         log_stats: bool = False,
     ) -> None:
+        logger.info('Scheduler::init')
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
@@ -58,7 +59,6 @@ class Scheduler(SchedulerInterface):
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
         self.structured_output_manager = structured_output_manager
-
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
         # by update_from_outputs(). This is currently used in the multi-engine
@@ -362,12 +362,16 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks, num_new_local_computed_tokens = \
                         self.kv_cache_manager.get_computed_blocks(
                             request)
+                    
+                    logger.info(f"Request {request.request_id} has {num_new_local_computed_tokens} new local computed tokens, # prompt tokens: {request.num_prompt_tokens}")
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
                         num_external_computed_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens))
+
+                    logger.info(f"Request {request.request_id} has {num_external_computed_tokens} new external computed tokens, load_kv_async: {load_kv_async}")
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (num_new_local_computed_tokens +
@@ -428,7 +432,7 @@ class Scheduler(SchedulerInterface):
                 effective_lookahead_tokens = (0 if request.num_computed_tokens
                                               == 0 else
                                               self.num_lookahead_tokens)
-
+                logger.info(f"Request {request.request_id} has {num_new_tokens + num_external_computed_tokens} new tokens to schedule, num_new_local_computed_tokens: {num_new_local_computed_tokens}, load_kv_async {load_kv_async}")
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens + num_external_computed_tokens,
@@ -991,8 +995,24 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting)
 
     def add_request(self, request: Request) -> None:
+        if request.request_id in self.requests:
+            logger.info(f"Received request {request.request_id} that is already in the scheduler, finishing the request sending on local server")
+            logger.info(f"New: {request}")
+            old_request = self.requests[request.request_id]
+            logger.info(f"Old: {old_request}")
+            logger.info(f"Block Ids: {self.kv_cache_manager.get_block_ids(request.request_id)}")
+            old_request.sampling_params = request.sampling_params
+            old_request.priority = request.priority
+            old_request.arrival_time = request.arrival_time
+            old_request.status = RequestStatus.WAITING
+            old_request.stop_reason = None
+            for k in ['do_remote_prefill', 'do_remote_decode']:
+                if k in request.kv_transfer_params:
+                    old_request.kv_transfer_params[k] = False
+            old_request.max_tokens = request.max_tokens
+            request = old_request
         self.waiting.add_request(request)
-        self.requests[request.request_id] = request
+        self.requests[request.request_id] = request    
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
 
@@ -1057,6 +1077,9 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        import traceback
+        logger.info(traceback.format_stack())
+        logger.info(f"Freeing blocks for request {request.request_id}")
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
@@ -1180,5 +1203,7 @@ class Scheduler(SchedulerInterface):
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.add(req_id)
         for req_id in (kv_connector_output.finished_sending or ()):
-            logger.debug("Finished sending KV transfer for request %s", req_id)
-            self._free_blocks(self.requests[req_id])
+            logger.debug("Finished sending KV transfer for request %s, request status: %s", req_id, self.requests[req_id].status)
+            request = self.requests[req_id]
+            if request.is_finished():
+                self._free_blocks(request)

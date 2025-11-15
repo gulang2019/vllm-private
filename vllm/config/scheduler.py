@@ -158,7 +158,65 @@ class SchedulerConfig:
     async scheduling is currently not supported with some features such as
     structured outputs, speculative decoding, and pipeline parallelism.
     """
-
+    
+    scheduling_policy: str = "vllm"
+    """The admission policy to use:\n
+    - "fcfs" means first come first served, i.e. requests are handled in order
+    of arrival.\n
+    - "edd" means requests are admitted based on EDD (Earliest Deadline First) policy.
+    - "slosserve" means requests are admitted based on SLOSServe policy."""
+    
+    allow_rejection: bool = False
+    """
+    Whether to allow rejection of requests.
+    If not, the scheduler should guarantee all requests are finished.
+    """
+    
+    slo_ttft_per_token: float = 1.0
+    """The maximum slowdown of the TTFT."""
+    
+    slo_ttft_constant: float = 0.0
+    """The constant overhead of the TTFT."""
+    
+    slo_tpot: float = 0.0
+    """The TPoT."""
+    
+    scheduling_overhead: float = 0.0
+    """The scheduling overhead."""
+    
+    engine_id: int = -1
+    """The engine id."""
+    
+    queue_length_threshold: int | None = None
+    """The threshold of the queue length."""
+    
+    max_decoding_length: int | None = None 
+    """The maximum decoding length."""
+    
+    is_mock_connector: bool = False
+    """Whether to use mock connector."""
+    
+    slosserve_token_headroom: int = 1
+    '''The token headroom of the SLOSServe scheduler.'''
+    
+    admission_mode: str = 'anytime'
+    """The admission mode to use:\n
+    - "anytime" means requests are admitted anytime.\n
+    - "instant" means requests are admitted only when they are instant."""
+    
+    length_pattern: str = 'default'
+    """The length pattern to use:\n
+    - "default" means the default length pattern.\n
+    - "sharegpt_code" means the sharegpt code length pattern.\n
+    - "azure_chat_23" means the azure chat 23 length pattern.\n
+    - "arxiv_summary" means the arxiv summary length pattern."""
+    
+    model_name: str = 'Qwen/Qwen2.5-7B-Instruct'
+    """The model name to use."""
+    
+    record_events: bool = False
+    """Whether to record events."""
+    
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

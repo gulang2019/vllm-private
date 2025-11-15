@@ -1087,6 +1087,39 @@ class AsyncLLMEngine(EngineClient):
     async def stop_profile(self) -> None:
         self.engine.stop_profile()
 
+    async def dump_profile_events(self, filename: str) -> None:
+        """Dump profile events to file."""
+        # Access the core engine through the engine hierarchy
+        if hasattr(self.engine, 'engine_core') and hasattr(self.engine.engine_core, 'engine_core'):
+            core_engine = self.engine.engine_core.engine_core
+            if hasattr(core_engine, 'dump_profile_events'):
+                await core_engine.dump_profile_events(filename)
+            else:
+                raise NotImplementedError("dump_profile_events method not found on core engine")
+        else:
+            raise NotImplementedError("Core engine not accessible")
+
+    async def update_config(self, config: dict):
+        if hasattr(self.engine, 'engine_core') and hasattr(self.engine.engine_core, 'engine_core'):
+            core_engine = self.engine.engine_core.engine_core
+            if hasattr(core_engine, 'update_config'):
+                await core_engine.update_config(config)
+            else:
+                raise NotImplementedError("update_config method not found on core engine")
+        else:
+            raise NotImplementedError("Core engine not accessible")
+    
+    async def profile_step(self, request_json: dict):
+        if hasattr(self.engine, 'engine_core') and hasattr(self.engine.engine_core, 'engine_core'):
+            core_engine = self.engine.engine_core.engine_core
+            if hasattr(core_engine, 'profile_step'):
+                return await core_engine.profile_step(request_json)
+            else:
+                raise NotImplementedError("update_config method not found on core engine")
+        else:
+            raise NotImplementedError("Core engine not accessible")
+
+
     async def reset_mm_cache(self) -> None:
         self.engine.reset_mm_cache()
 

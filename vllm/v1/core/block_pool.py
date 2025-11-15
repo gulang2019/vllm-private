@@ -254,6 +254,11 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null
         ])
 
+    def get_num_freed_blocks_after_free(self, ordered_blocks: Iterable[KVCacheBlock]) -> int:
+        """Get the number of available blocks after freeing the request."""
+        blocks_list = list(ordered_blocks)
+        return len([block for block in blocks_list if block.ref_cnt == 1 and not block.is_null])
+
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalid prefix caching after the weights are updated,

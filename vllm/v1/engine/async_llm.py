@@ -206,6 +206,15 @@ class AsyncLLM(EngineClient):
             client_count=client_count,
             client_index=client_index,
         )
+        
+    async def dump_profile_events(self, filename: str, dp_rank: int = 0):
+        await self.engine_core.dump_profile_events(filename, dp_rank)
+
+    async def update_config(self, config: dict, dp_rank: int = 0):
+        await self.engine_core.update_config_async(config, dp_rank)
+
+    async def profile_step(self, request_json: dict) -> dict:
+        return await self.engine_core.profile_step_async(request_json)
 
     @classmethod
     def from_engine_args(
@@ -715,3 +724,6 @@ class AsyncLLM(EngineClient):
     @property
     def dead_error(self) -> BaseException:
         return EngineDeadError()
+
+    async def get_load_statistics(self, t: float = 1) -> list[dict[str, Any]]:
+        return await self.engine_core.get_load_statistics_async(t)
