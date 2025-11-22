@@ -1690,7 +1690,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting_attainable) + len(self.waiting_unattainable)
 
-    def add_request(self, request: Request) -> None:
+    def add_request(self, request: Request) -> bool:
         # logger.info(
         #     f"Adding request: engine_id={self.scheduler_config.engine_id}, "
         #     f"request_id={request.request_id}, max_tokens={request.max_tokens}, "
