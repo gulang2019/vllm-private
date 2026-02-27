@@ -13,6 +13,7 @@ import math
 import asyncio
 import json
 import bisect
+import copy
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
@@ -44,7 +45,8 @@ from vllm.v1.structured_output import StructuredOutputManager
 import SLOsServe_C
 from dataclasses import dataclass, field
 
-
+from SLOsServe.router.execplan_bus import ExecPlan
+from SLOsServe.router.adm_ctrl import BatchPlanner
 
 logger = init_logger(__name__)
         
@@ -303,17 +305,27 @@ class SchedulerAdmCtrl(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         from motivation.common import PerfModel
         self.perf_model = PerfModel.get_perf_model(self.scheduler_config.model_name, self.scheduler_config.length_pattern)
-        self.slosserve_scheduler = SLOsServe_C.AdmCtrlScheduler(self.scheduler_config.scheduling_policy, False)
+        self.slosserve_scheduler = SLOsServe_C.AdmCtrlScheduler(self.scheduler_config.scheduling_policy, False, False)
         self.perf_model.hardware_params[4] += self.scheduler_config.scheduling_overhead
         self.slosserve_scheduler.set_ar_planner(
             tpots = [self.get_tpot_slo()],
             hardware_params = self.perf_model.hardware_params,
-            fixed_bs = False 
+            fixed_bs = False,
+            max_bs = self.scheduler_config.max_num_batched_tokens
         )
         logger.info(f'fetching perf model for model_name: {self.scheduler_config.model_name} and length_pattern: {self.scheduler_config.length_pattern}')
         logger.info(f'updating slosserve scheduler with TPOT: {self.get_tpot_slo()} and hardware_params: {self.perf_model.hardware_params}')
         if self.scheduler_config.scheduling_policy in ["dp", "edf"]:
             self.stateless_schedule_fn = self._schedule_stateless_slosserve
+        elif self.scheduler_config.scheduling_policy == 'atfc':
+            self.stateless_schedule_fn = self._schedule_stateless_atfc
+            self.atfc_planner = BatchPlanner(
+                _perf_model = copy.deepcopy(self.perf_model),
+                _max_lookahead = 100,
+                _num_free_blocks = self.kv_cache_manager.get_num_free_blocks(),
+                _block_size = self.cache_config.block_size,
+                _max_decode_length = self.scheduler_config.max_decoding_length
+            )
         elif 'vllm' in self.scheduler_config.scheduling_policy:
             self.stateless_schedule_fn = self._schedule_stateless_vllm
         else:
@@ -333,7 +345,8 @@ class SchedulerAdmCtrl(SchedulerInterface):
         print('kv cache manager initialized', self.kv_cache_manager)
         self._load_statistics: list = []
         self._timer = Timer()
-    
+        self._exec_plan = None
+            
     def get_load_statistics(self, t: float = 5) -> list[dict[str, Any]]:
         earliest_time = time.time() - t
         idx = len(self._load_statistics) - 1
@@ -458,16 +471,28 @@ class SchedulerAdmCtrl(SchedulerInterface):
         from motivation.common import PerfModel
         self.perf_model = PerfModel.get_perf_model(self.scheduler_config.model_name, self.scheduler_config.length_pattern)
         self.perf_model.hardware_params[4] += self.scheduler_config.scheduling_overhead
-        self.slosserve_scheduler = SLOsServe_C.AdmCtrlScheduler(self.scheduler_config.scheduling_policy, False)
+        self.perf_model.hardware_params = [x * self.scheduler_config.perf_model_err for x in self.perf_model.hardware_params]
+        self.slosserve_scheduler = SLOsServe_C.AdmCtrlScheduler(self.scheduler_config.scheduling_policy, False, False)
         self.slosserve_scheduler.set_ar_planner(
             tpots = [self.get_tpot_slo()],
             hardware_params = self.perf_model.hardware_params,
-            fixed_bs = False 
+            fixed_bs = False,
+            max_bs = self.scheduler_config.max_num_batched_tokens
         )
-        logger.info(f'fetching perf model for model_name: {self.scheduler_config.model_name} and length_pattern: {self.scheduler_config.length_pattern}')
+        logger.info(f'fetching perf model for model_name: {self.scheduler_config.model_name} and length_pattern: {self.scheduler_config.length_pattern}, perf model err: {self.scheduler_config.perf_model_err}')
         logger.info(f'updating slosserve scheduler with TPOT: {self.get_tpot_slo()} and hardware_params: {self.perf_model.hardware_params}')
         if self.scheduler_config.scheduling_policy in ["dp", "edf"]:
             self.stateless_schedule_fn = self._schedule_stateless_slosserve
+        elif self.scheduler_config.scheduling_policy == 'atfc':
+            self.stateless_schedule_fn = self._schedule_stateless_atfc
+            self.atfc_planner = BatchPlanner(
+                _perf_model = copy.deepcopy(self.perf_model),
+                _max_lookahead = 100,
+                _num_free_blocks = self.kv_cache_manager.get_num_free_blocks(),
+                _block_size = self.cache_config.block_size,
+                _max_decode_length = self.scheduler_config.max_decoding_length,
+                _profile_events = self._profile_events
+            )
         elif 'vllm' in self.scheduler_config.scheduling_policy:
             self.stateless_schedule_fn = self._schedule_stateless_vllm
         else:
@@ -483,10 +508,16 @@ class SchedulerAdmCtrl(SchedulerInterface):
         
         self.rejected_reqs: list[Request] = []
         self._req_cached_tokens: dict[str, int] = {}
+        
         logger.info(f'SchedulerAdmCtrl::reset {self.scheduler_config}, max_num_batched_tokens: {self.max_num_scheduled_tokens}')
     
     def get_tpot_slo(self):
         return self.scheduler_config.slo_tpot
+
+    def _get_prefill_ddl(self, req: Request):
+        if self.scheduler_config.routing_overhead < 0:
+            return req.router_arrival_time + req.slo_ttft
+        return req.arrival_time + self.scheduler_config.routing_overhead + req.slo_ttft
 
     def current_time(self) -> float:
         return self.timer.current_time()
@@ -500,7 +531,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         if remain_prefill_tokens == 0: return True
         # estimated_prefill_time = self.perf_model.get_batch_time([(request.num_computed_tokens, remain_prefill_tokens)])
         
-        return self.timer.current_time() < request.prefill_ddl
+        return self.timer.current_time() < self._get_prefill_ddl(request)
 
     def _schedule_stateless_vllm(self) -> tuple[tuple[list[Request], list[Request], list[Request], list[Request]], dict[str, int]]:
         '''
@@ -783,14 +814,25 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     'next': 0
                 }]
             })
+            self._exec_plan = ExecPlan()
+            num_computed_tokens = [(req.request_id, req.num_computed_tokens) for req in self.running]
+            now = time.time()
+            for i in range(10):
+                batch_time = self.perf_model.get_batch_time([(x[1] + i,1) for x in num_computed_tokens])
+                now += batch_time 
+                for rid, n_token in num_computed_tokens:
+                    self._exec_plan.req_plans[rid].append((n_token + i + 1, i))
+                self._exec_plan.batch_times.append(now)
                         
             return ([], [], [], []), {req.request_id: 1 for req in self.running if req not in waiting_reqs}
+        
         
         promax_reqs = []
         num_free_blocks = self.kv_cache_manager.get_num_free_blocks()
         # mem_per_request = self.max_model_len // self.kv_cache_manager.block_size
         
         for req in waiting_reqs:
+            # print('ddl', self._get_prefill_ddl(req), 'now', self.scheduled_timestamp, 'req', req)
             if req.num_computed_tokens == 0:
                 new_computed_blocks, num_new_local_computed_tokens = \
                     self.kv_cache_manager.get_computed_blocks(req)
@@ -806,7 +848,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
             promax_reqs.append(SLOsServe_C.Request(
                 id = req.request_id,
                 is_new_req = True, 
-                ddl = req.prefill_ddl,
+                ddl = self._get_prefill_ddl(req),
                 input_length = input_length,
                 n_computed_tokens = req.num_computed_tokens,
                 profit = profit,
@@ -815,7 +857,8 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 prefill_mem = prefill_mem,
                 prefill_device_id = 0, 
                 decode_device_id = 0,
-                prefill_only = req.max_tokens == 1
+                prefill_only = req.max_tokens == 1,
+                arrival_time = req.arrival_time
             ))
             
             if is_batch_sch and self.scheduler_config.record_events:
@@ -827,15 +870,14 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     'num_prompt_tokens': req.num_prompt_tokens,
                     'num_computed_tokens': req.num_computed_tokens,
                     'num_output_tokens': req.num_output_tokens,
-                    'ddl': req.prefill_ddl,
+                    'ddl': self._get_prefill_ddl(req),
                 })
         self._timer.stop('prepare_waitings')
-
         for req in self.running:
             mem = math.ceil((req.num_prompt_tokens + req.max_tokens) / self.block_size)
             prefill_mem = math.ceil((req.num_prompt_tokens) / self.block_size)
             profit = req.sampling_params.extra_args.get('profit', 1)
-            ddl = req.prefill_ddl + max(req.num_output_tokens - self.scheduler_config.slosserve_token_headroom, 0) * self.get_tpot_slo()
+            ddl = self._get_prefill_ddl(req) + max(req.num_output_tokens - self.scheduler_config.slosserve_token_headroom, 0) * self.get_tpot_slo()
             ddl = max(ddl, self.scheduled_timestamp)
             promax_reqs.append(SLOsServe_C.Request(
                 id = req.request_id,
@@ -845,12 +887,13 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     - req.num_computed_tokens, 0),
                 profit = profit,
                 n_computed_tokens = req.num_computed_tokens,
-                mem = mem,
+                mem = 0,
                 tpot_idx = 0,
                 prefill_mem = prefill_mem,
                 prefill_device_id = 0, 
                 decode_device_id = 0,
-                prefill_only = req.max_tokens == 1
+                prefill_only = req.max_tokens == 1,
+                arrival_time = req.arrival_time
             ))
             if is_batch_sch and self.scheduler_config.record_events:
                 self._profile_events.append({
@@ -867,15 +910,14 @@ class SchedulerAdmCtrl(SchedulerInterface):
         self._timer.stop('prepare_runnings')
         for req in promax_reqs:
             req.ddl -= self.scheduled_timestamp
-        
         start_time = time.time()
         is_feasible, accpeted_ids, batch_schedules = self.slosserve_scheduler.schedule(
             promax_reqs, num_free_blocks, 0.0, False
         )
+        self._update_exec_plan(batch_schedules=batch_schedules)
         overhead = time.time() - start_time
         
         self._timer.stop('backend_schedule')
-        
         
         if not hasattr(self, 'i'):
             self.i = 0
@@ -888,10 +930,11 @@ class SchedulerAdmCtrl(SchedulerInterface):
         resumed_reqs: list[Request] = []
         num_scheduled_tokens: dict[str, int] = {}
         
+        
         for request in waiting_reqs:
             if request.request_id in accpeted_ids:
                 admitted_reqs.append(request)
-            elif self.scheduler_config.admission_mode == 'instant' or not self._is_attainable(request):
+            elif self.scheduler_config.admission_mode == 'arrival' or (not self._is_attainable(request)):
                 rejected_reqs.append(request)
                 
         for request in self.running:
@@ -902,8 +945,8 @@ class SchedulerAdmCtrl(SchedulerInterface):
             self._timer.stop('no_batch_schedules')
             return (preempted_reqs, admitted_reqs, rejected_reqs, resumed_reqs), num_scheduled_tokens
         
-        if is_batch_sch and self.scheduler_config.record_events:
-            self._profile_events.append({
+        if (is_batch_sch and self.scheduler_config.record_events) or overhead > 0.1:
+            sch_problem = {
                 'event_type': 'schedule_problem', 
                 'timestamp': time.time(),
                 'batch_id': getattr(self, 'batch_id', -1),
@@ -927,33 +970,42 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 'accepted_ids': accpeted_ids,
                 'batch_schedule': [{'id': batch.id, 'n': batch.n} for batch in batch_schedules[0].req_batches],
                 'overhead': overhead
-            })
+            }
+            self._profile_events.append(sch_problem)
 
         self._timer.stop('schedule_problem')
         for req_batch in batch_schedules[0].req_batches:
             if req_batch.n > 0:
                 num_scheduled_tokens[req_batch.id] = req_batch.n
-
-        future_batches = []
-        for batch in batch_schedules[:10]:
-            n_tokens = sum([req_batch.n for req_batch in batch.req_batches])
-            future_batches.append({
-                'n_tokens': n_tokens,
-                'prefill_bs': batch.prefill_bs,
-                'estimated_time': batch.estimated_time,
-                'next': batch.next
-            })
-
-
-        self._load_statistics.append({
-            'timestamp': time.time(),
-            'type': 'slosserve',
-            'future_batches': future_batches            
-        })
         
-        self._timer.stop(f'prepare_future_batches {len(batch_schedules)}')
+        # print('admitted', admitted_reqs, 'rejected_reqs', rejected_reqs, 'num_scheduled_tokens', num_scheduled_tokens)
         
         return (preempted_reqs, admitted_reqs, rejected_reqs, resumed_reqs), num_scheduled_tokens
+
+    def _schedule_stateless_atfc(self) -> tuple[tuple[list[Request], list[Request], list[Request], list[Request]], dict[str, int]]:
+        preempted_reqs, rejected_reqs, resumed_reqs = [], [], []
+        num_scheduled_tokens, admitted_reqs, self._exec_plan = self.atfc_planner.get_next_batch_and_admitted_reqs()
+        # every waiting_reqs should be accepted
+        # This could be wrong when requests come from kv_ready
+        # assert all(req.request_id in admitted_reqs for req in self.waiting_attainable)
+        return (preempted_reqs, copy.copy(self.waiting_attainable), rejected_reqs, resumed_reqs), num_scheduled_tokens
+
+    def _update_exec_plan(self, batch_schedules) -> None:
+        now = time.time()
+        self._exec_plan = ExecPlan()
+        num_computed_tokens = {}
+        
+        for bid, batch_sch in enumerate(batch_schedules):
+            now += batch_sch.estimated_time
+            self._exec_plan.batch_times.append(now)
+            for req_batch in batch_sch.req_batches:
+                if req_batch.id not in num_computed_tokens:
+                    num_computed_tokens[req_batch.id] = self.requests[req_batch.id].num_computed_tokens
+                num_computed_tokens[req_batch.id] += req_batch.n              
+                self._exec_plan.req_plans[req_batch.id].append((num_computed_tokens[req_batch.id], bid))
+
+    def get_exec_plan(self):
+        return self._exec_plan
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1035,6 +1087,9 @@ class SchedulerAdmCtrl(SchedulerInterface):
         scheduled_running_reqs = list([self.requests[x] for x in num_scheduled_tokens.keys() \
             if self.requests[x].status == RequestStatus.RUNNING and self.requests[x].scheduled])
        
+        # we need to pop request if it is not in the waiting_kv_transfer
+        waiting_kv_xfer_req_ids = set(req.request_id for req in self.waiting_kv_xfer)
+        num_scheduled_tokens = {k: v for k, v in num_scheduled_tokens.items() if k not in waiting_kv_xfer_req_ids}
         self._timer.stop('stateless_schedule_fn')
        
         # for name, reqs in [('admitted', admitted_reqs), ('resumed', resumed_reqs), ('preempted', preempted_reqs), ('rejected', rejected_reqs)]:
@@ -1228,14 +1283,14 @@ class SchedulerAdmCtrl(SchedulerInterface):
         events = self.kv_cache_manager.take_events()
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
-            self.kv_event_publisher.publish(batch)
-            
+            self.kv_event_publisher.publish(batch)        
 
         self._update_after_schedule(scheduler_output)
         self._timer.stop('end')
         
         if self._timer.tot > 0.1:
             logger.warning(f'LONG SCHEDULING: {self._timer.get()}, time: {self._timer.tot}, # waiting: {len(self.waiting_attainable)}, # running: {len(self.running)}')
+        
         return scheduler_output
 
 
@@ -1448,7 +1503,8 @@ class SchedulerAdmCtrl(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
         elapsed_time: float = 0.0,
     ) -> dict[int, EngineCoreOutputs]:
-
+        
+        
         for stat in self._load_statistics[::-1]:
             if stat['type'] == 'slosserve':
                 stat.update({'elapsed': elapsed_time})
@@ -1561,6 +1617,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,
                         num_cached_tokens=request.num_cached_tokens,
+                        num_computed_tokens=request.num_computed_tokens
                     ))
 
             else:
@@ -1620,6 +1677,13 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 # outputs this step.
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
+
+        if self.scheduler_config.scheduling_policy == 'atfc':
+            self.atfc_planner.commit_batch(
+                num_scheduled_tokens = scheduler_output.num_scheduled_tokens,
+                finished_reqs = [req.request_id for req in stopped_reqs],
+                num_free_blocks = self.kv_cache_manager.get_num_free_blocks()
+            )
 
         return engine_core_outputs
 
@@ -1696,7 +1760,6 @@ class SchedulerAdmCtrl(SchedulerInterface):
         #     f"request_id={request.request_id}, max_tokens={request.max_tokens}, "
         #     f"prompt_tokens={request.num_prompt_tokens}, sampling_params={request.sampling_params}"
         # )
-        
         if request.request_id in self.requests:
             # logger.info(f"Received request {request.request_id} that is already in the scheduler, finishing the request sending on local server")
             # logger.info(f"New: {request}")
@@ -1715,63 +1778,92 @@ class SchedulerAdmCtrl(SchedulerInterface):
             old_request.scheduled = False
             request = old_request
         
+        new_computed_blocks, num_new_local_computed_tokens = \
+                    self.kv_cache_manager.get_computed_blocks(
+                        request)
+        
+        request.num_computed_tokens = num_new_local_computed_tokens
+        
         load_kv_async = False
+        num_external_computed_tokens = 0
+        
         if self.connector is not None:
-            new_computed_blocks, num_new_local_computed_tokens = \
-                        self.kv_cache_manager.get_computed_blocks(
-                            request)
             num_external_computed_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens))
-            # logger.info(f"Request {request.request_id} has {num_external_computed_tokens} new external computed tokens, load_kv_async: {load_kv_async}")
-            if load_kv_async: # we only allocate for requests that are waiting for remote kv
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_external_computed_tokens,
-                        num_new_local_computed_tokens,
-                        new_computed_blocks,
-                        num_lookahead_tokens=0,
-                        delay_cache_blocks=True,
-                    )
-                if new_blocks is None:
-                    # we cannot schedule this request
-                    self.finish_requests(request.request_id, RequestStatus.FINISHED_REJECTED)
-                    self._profile_events.append({
-                        "event_type": "finish",
-                        "request_id": request.request_id,
-                        "timestamp": time.time(),
-                        "finish_reason": "rejected-oom",
-                    })
-                    return False
-                
-                self.connector.update_state_after_alloc(
-                    request,
-                    new_blocks,
-                    num_external_computed_tokens,
-                )
-        
-        if self.vllm_config.is_simulation == 'emulate' and request.num_computed_tokens > 0:
-            new_blocks = self.kv_cache_manager.allocate_slots(
-                request,
-                request.num_computed_tokens,
+                    
+        if self.scheduler_config.scheduling_policy == 'atfc':
+            feasible = self.atfc_planner.add_request(
+                request_id = request.request_id, 
+                num_prompt_tokens = request.num_prompt_tokens,
+                num_computed_tokens = num_new_local_computed_tokens + num_external_computed_tokens,
+                prefill_ddl = self._get_prefill_ddl(request),
+                slo_tpot = self.get_tpot_slo(),
+                prefill_only = request.kv_transfer_params.get('do_remote_decode', False) if request.kv_transfer_params is not None else False,
+                kv_ready_time = request.kv_transfer_params.get('arrival_time', None) if (load_kv_async and request.kv_transfer_params is not None) else None,
+                must_admit = request.sampling_params.extra_args.get('must_admit', False)
             )
-            if new_blocks is None:
+            if not feasible: 
                 return False
+            
+        # if load_kv_async: # we only allocate for requests that are waiting for remote kv
+        if load_kv_async:
+            assert num_external_computed_tokens > 0
+            new_blocks = self.kv_cache_manager.allocate_slots(
+                    request,
+                    num_external_computed_tokens,
+                    num_new_local_computed_tokens,
+                    new_computed_blocks,
+                    num_lookahead_tokens=0,
+                    delay_cache_blocks=True,
+                )
+
+            if new_blocks is None:
+                # we cannot schedule this request
+                self.finish_requests(request.request_id, RequestStatus.FINISHED_REJECTED)
+                self._profile_events.append({
+                    "event_type": "finish",
+                    "request_id": request.request_id,
+                    "timestamp": time.time(),
+                    "finish_reason": "rejected-oom",
+                })
+                if self.scheduler_config.scheduling_policy == 'atfc':
+                    self.atfc_planner.finish_request(request.request_id)
+                return False
+        
+            self.connector.update_state_after_alloc(
+                request,
+                new_blocks,
+                num_external_computed_tokens,
+            )
+
+        # if self.vllm_config.is_simulation == 'emulate' and request.num_computed_tokens > 0:
+        #     new_blocks = self.kv_cache_manager.allocate_slots(
+        #         request,
+        #         request.num_computed_tokens,
+        #     )
+        #     if new_blocks is None:
+        #         return False
 
         if load_kv_async:
             self.waiting_kv_xfer.append(request)
             request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
         else:
+            # if self.scheduler_config.scheduling_policy in ['dp', 'edf']:
+            #     self.scheduled_timestamp = time.time()
+            #     (preempted_reqs, admitted_reqs, rejected_reqs, resumed_reqs), num_scheduled_tokens = self._schedule_stateless_slosserve(waiting_reqs = [request])
+            #     if not len(admitted_reqs): 
+            #         return False
+            # else:
+            # if self.scheduler_config.queue_length_threshold is not None:
+            # if len(self.waiting_attainable) >= 20:
+            #             return False
+            
             if self.scheduler_config.scheduling_policy in ['dp', 'edf']:
-                self.scheduled_timestamp = time.time()
-                (preempted_reqs, admitted_reqs, rejected_reqs, resumed_reqs), num_scheduled_tokens = self._schedule_stateless_slosserve(waiting_reqs = [request])
-                if not len(admitted_reqs): 
+                if self._exec_plan is not None and \
+                    len(self._exec_plan.batch_times) and \
+                    ((max(self._exec_plan.batch_times[0], time.time()) + self.perf_model.get_batch_time([(0, request.num_prompt_tokens)])) > self._get_prefill_ddl(request)):
                     return False
-            else:
-                if self.scheduler_config.queue_length_threshold is not None:
-                    if len(self.waiting_attainable) + len(self.running) >= self.scheduler_config.queue_length_threshold:
-                        return False
-
             if self.policy == SchedulingPolicy.FCFS:
                 self.waiting_attainable.append(request)
             else:

@@ -47,6 +47,7 @@ class CompletionOutput:
     finish_reason: Optional[str] = None
     stop_reason: Union[int, str, None] = None
     lora_request: Optional[LoRARequest] = None
+    num_computed_tokens: Optional[int] = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None

@@ -119,6 +119,8 @@ class EngineCoreOutput(
 
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
+    # The number of tokens computed so far
+    num_computed_tokens: int = 0
 
     @property
     def finished(self) -> bool:

@@ -217,6 +217,18 @@ class SchedulerConfig:
     record_events: bool = False
     """Whether to record events."""
     
+    perf_model_err: float = 1.0
+    """The performance model used v.s. real performance model."""
+    
+    routing_overhead: float = -1.0
+    """The routing overhead from centralized router to local engine. Used for mock engine. <0 means no mocking."""
+    
+    fifo_fair: bool = False
+    """Whether the admission respects the FIFO fairness."""
+    
+    oracle_mem: bool = False
+    """Whether the scheduler assumes knowledge on the decode length"""
+    
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

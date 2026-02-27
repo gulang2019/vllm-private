@@ -210,10 +210,17 @@ class Request:
         return events
     
     @property
-    def prefill_ddl(self) -> float:
-        # return self.sampling_params.extra_args.get('prefill_ddl', 
-        #     self.sampling_params.extra_args['slo_ttft'] + self.arrival_time)
-        return self.sampling_params.extra_args['slo_ttft'] + self.arrival_time
+    def slo_ttft(self) -> float:
+        return self.sampling_params.extra_args['slo_ttft']
+    
+    @property
+    def router_arrival_time(self) -> float:
+        return self.sampling_params.extra_args['router_arrival_time']
+    # @property
+    # def prefill_ddl(self) -> float:
+    #     # return self.sampling_params.extra_args.get('prefill_ddl', 
+    #     #     self.sampling_params.extra_args['slo_ttft'] + self.arrival_time)
+    #     return self.sampling_params.extra_args['slo_ttft'] + self.arrival_time
     
     def __str__(self):
         # String representation containing all relevant state of the request.
