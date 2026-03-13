@@ -1821,16 +1821,19 @@ class SchedulerAdmCtrl(SchedulerInterface):
                                 request, num_new_local_computed_tokens))
         timer.stop('get_num_new_matched_tokens')
         if self.scheduler_config.scheduling_policy == 'atfc':
-            feasible = self.atfc_planner.add_request(
-                request_id = request.request_id, 
-                num_prompt_tokens = request.num_prompt_tokens,
-                num_computed_tokens = num_new_local_computed_tokens + num_external_computed_tokens,
-                prefill_ddl = self._get_prefill_ddl(request),
-                slo_tpot = self.get_tpot_slo(),
-                prefill_only = request.kv_transfer_params.get('do_remote_decode', False) if request.kv_transfer_params is not None else False,
-                kv_ready_time = request.kv_transfer_params.get('arrival_time', None) if (load_kv_async and request.kv_transfer_params is not None) else None,
-                must_admit = request.sampling_params.extra_args.get('must_admit', False)
-            )
+            if self.scheduler_config.admission_mode == "off":
+                feasible = True
+            else:
+                feasible = self.atfc_planner.add_request(
+                    request_id = request.request_id, 
+                    num_prompt_tokens = request.num_prompt_tokens,
+                    num_computed_tokens = num_new_local_computed_tokens + num_external_computed_tokens,
+                    prefill_ddl = self._get_prefill_ddl(request),
+                    slo_tpot = self.get_tpot_slo(),
+                    prefill_only = request.kv_transfer_params.get('do_remote_decode', False) if request.kv_transfer_params is not None else False,
+                    kv_ready_time = request.kv_transfer_params.get('arrival_time', None) if (load_kv_async and request.kv_transfer_params is not None) else None,
+                    must_admit = request.sampling_params.extra_args.get('must_admit', False)
+                )
             timer.stop('atfc_planner.add_request')
             if not feasible: 
                 timer.display(thresh = 0.1, label = 'LONGATFC')
