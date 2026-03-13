@@ -192,7 +192,7 @@ class SchedulerConfig:
     
     max_decoding_length: int | None = None 
     """The maximum decoding length."""
-    
+        
     is_mock_connector: bool = False
     """Whether to use mock connector."""
     
