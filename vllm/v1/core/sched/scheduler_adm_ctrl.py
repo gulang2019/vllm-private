@@ -1227,6 +1227,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     self._timer.stop('allocate_slots_3')
             # assert new_blocks is not None
             if new_blocks is None:
+                # TODO(Yi): here is the OOM during execution; report it back by adding to profile_events
                 logger.error(f"Request {request.request_id} cannot be scheduled")
                 failed_requests.append(request)
                 continue
@@ -1848,7 +1849,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 )
             timer.stop('allocate_slots')
             if new_blocks is None:
-                # we cannot schedule this request
+                # TODO(Yi): here is OOM upon arriaval;
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_REJECTED)
                 self._profile_events.append({
                     "event_type": "finish",
