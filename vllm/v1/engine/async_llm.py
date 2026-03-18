@@ -4,6 +4,7 @@ import asyncio
 import os
 import socket
 import time
+import weakref
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
 from typing import Any, Optional, Union
@@ -140,6 +141,8 @@ class AsyncLLM(EngineClient):
             self.logger_manager.log_engine_initialized()
 
         self.output_handler: Optional[asyncio.Task] = None
+        self._engine_state_bus: Any | None = None
+        self._engine_state_device_id: int = 0
         try:
             # Start output handler eagerly if we are in the asyncio eventloop.
             asyncio.get_running_loop()
@@ -254,10 +257,28 @@ class AsyncLLM(EngineClient):
 
         cancel_task_threadsafe(getattr(self, "output_handler", None))
 
+    def set_engine_state_publisher(self, execplan_bus: Any,
+                                   device_id: int) -> None:
+        self._engine_state_bus = execplan_bus
+        self._engine_state_device_id = device_id
+
+    @staticmethod
+    def _materialize_engine_state_snapshot(
+        engine_state_snapshot: Any | None
+    ) -> tuple[Any | None, dict[str, int]]:
+        from SLOsServe.router.execplan_bus import (normalize_exec_plan,
+                                                   normalize_load_stats)
+
+        if not isinstance(engine_state_snapshot, dict):
+            return None, normalize_load_stats(None)
+
+        return (normalize_exec_plan(engine_state_snapshot.get("exec_plan")),
+                normalize_load_stats(engine_state_snapshot.get("load_stats")))
+
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return await self.engine_core.get_supported_tasks_async()
 
-    async def add_request(
+    async def _add_request_output_collector(
         self,
         request_id: str,
         prompt: PromptType,
@@ -269,7 +290,7 @@ class AsyncLLM(EngineClient):
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
     ) -> RequestOutputCollector:
-        """Add new request to the AsyncLLM."""
+        """Add new request to the AsyncLLM and return its output collector."""
 
         if self.errored:
             raise EngineDeadError()
@@ -299,6 +320,50 @@ class AsyncLLM(EngineClient):
                                     idx, queue)
         return queue
 
+    async def add_request(
+        self,
+        prompt: PromptType,
+        request_id: str,
+        sampling_params: SamplingParams,
+        lora_request: Optional[LoRARequest] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
+        priority: int = 0,
+        data_parallel_rank: Optional[int] = None,
+    ) -> tuple[bool, Optional[AsyncGenerator[RequestOutput, None]]]:
+        """
+        Add a request and return an admission decision plus its output stream.
+
+        This is intended for integrations that need an immediate admitted /
+        rejected signal before consuming the stream.
+        """
+        if self.errored:
+            raise EngineDeadError()
+
+        if sampling_params.n != 1:
+            raise ValueError("AsyncLLM.add_request only supports n == 1.")
+
+        self._run_output_handler()
+
+        queue = RequestOutputCollector(
+            output_kind=sampling_params.output_kind)
+
+        prompt_str, request = self.processor.process_inputs(
+            request_id, prompt, sampling_params, None, lora_request, None,
+            trace_headers, priority, data_parallel_rank)
+
+        self.output_processor.add_request(request, prompt_str, None, 0, queue)
+        admitted = await self.engine_core.add_request_with_admission_async(
+            request)
+
+        if self.log_requests:
+            action = "Added" if admitted else "Rejected"
+            logger.info("%s request %s.", action, request.request_id)
+
+        if not admitted:
+            return False, None
+
+        return True, self._request_output_generator(queue)
+
     async def _add_request(self, request: EngineCoreRequest,
                            prompt: Optional[str],
                            parent_req: Optional[ParentRequest], index: int,
@@ -313,6 +378,17 @@ class AsyncLLM(EngineClient):
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
+
+    async def _request_output_generator(
+        self,
+        queue: RequestOutputCollector,
+    ) -> AsyncGenerator[RequestOutput, None]:
+        finished = False
+        while not finished:
+            out = queue.get_nowait() or await queue.get()
+            assert isinstance(out, RequestOutput)
+            finished = out.finished
+            yield out
 
     # TODO: we should support multiple prompts in one call, as you
     # can do with LLM.generate. So that for multi-prompt completion
@@ -350,7 +426,7 @@ class AsyncLLM(EngineClient):
             # to handle startup failure gracefully in the OpenAI server.
             self._run_output_handler()
 
-            q = await self.add_request(
+            q = await self._add_request_output_collector(
                 request_id,
                 prompt,
                 sampling_params,
@@ -413,12 +489,31 @@ class AsyncLLM(EngineClient):
         output_processor = self.output_processor
         log_stats = self.log_stats
         logger_manager = self.logger_manager
+        materialize_engine_state_snapshot = (
+            AsyncLLM._materialize_engine_state_snapshot)
+        self_ref = weakref.ref(self)
+
+        def publish_engine_state(outputs) -> None:
+            _self = self_ref()
+            if _self is None:
+                return
+            engine_state_bus = _self._engine_state_bus
+            if engine_state_bus is None:
+                return
+            exec_plan, load_stats = materialize_engine_state_snapshot(
+                outputs.engine_state_snapshot)
+            engine_state_bus.publish.remote(_self._engine_state_device_id,
+                                            outputs.timestamp,
+                                            exec_plan,
+                                            load_stats=load_stats)
 
         async def output_handler():
             try:
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
+                    if outputs.engine_state_snapshot is not None:
+                        publish_engine_state(outputs)
                     num_outputs = len(outputs.outputs)
 
                     iteration_stats = IterationStats() if (
@@ -505,7 +600,7 @@ class AsyncLLM(EngineClient):
             # to handle startup failure gracefully in the OpenAI server.
             self._run_output_handler()
 
-            q = await self.add_request(
+            q = await self._add_request_output_collector(
                 request_id,
                 prompt,
                 pooling_params,
@@ -725,5 +820,5 @@ class AsyncLLM(EngineClient):
     def dead_error(self) -> BaseException:
         return EngineDeadError()
 
-    async def get_load_statistics(self, t: float = 1) -> list[dict[str, Any]]:
+    async def get_load_statistics(self, t: float = 1) -> dict[str, Any]:
         return await self.engine_core.get_load_statistics_async(t)

@@ -64,6 +64,10 @@ class EngineCoreRequest(
     # client for this request when scaling out the front-end.
     client_index: int = 0
 
+    # Optional call id used when the client needs an immediate
+    # admitted/rejected acknowledgment for this request.
+    admission_call_id: int = 0
+
     # Used in DP case to indicate which wave of requests this is expected to
     # belong to, to cover a race condition where the request is sent before
     # a wave finished notification is received.
@@ -161,6 +165,7 @@ class EngineCoreOutputs(
     outputs: list[EngineCoreOutput] = []
     scheduler_stats: Optional[SchedulerStats] = None
     timestamp: float = 0.0
+    engine_state_snapshot: Optional[dict[str, Any]] = None
 
     utility_output: Optional[UtilityOutput] = None
     finished_requests: Optional[set[str]] = None

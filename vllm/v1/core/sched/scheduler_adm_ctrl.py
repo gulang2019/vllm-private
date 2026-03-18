@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 
 from SLOsServe.router.execplan_bus import ExecPlan
 from SLOsServe.router.adm_ctrl import BatchPlanner
+from SLOsServe.router.macro import PERF_MODEL_HEADROOM
 
 logger = init_logger(__name__)
         
@@ -310,7 +311,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         from SLOsServe.perf_model import PerfModel
         self.perf_model = PerfModel.get_perf_model(self.scheduler_config.model_name, self.scheduler_config.length_pattern)
         self.slosserve_scheduler = SLOsServe_C.AdmCtrlScheduler(self.scheduler_config.scheduling_policy, self.block_size, False, False)
-        self.perf_model.hardware_params[4] += self.scheduler_config.scheduling_overhead
+        self.perf_model.hardware_params[4] += self.scheduler_config.scheduling_overhead + PERF_MODEL_HEADROOM
         self.slosserve_scheduler.set_ar_planner(
             tpots = [self.get_tpot_slo()],
             hardware_params = self.perf_model.hardware_params,
@@ -347,17 +348,15 @@ class SchedulerAdmCtrl(SchedulerInterface):
         self._req_cached_tokens: dict[str, int] = {}
         self._profile_events: list[dict] = []
         print('kv cache manager initialized', self.kv_cache_manager)
-        self._load_statistics: list = []
         self._timer = Timer()
         self._exec_plan = None
             
     def get_load_statistics(self, t: float = 5) -> list[dict[str, Any]]:
-        earliest_time = time.time() - t
-        idx = len(self._load_statistics) - 1
-        while idx >= 0 and self._load_statistics[idx]['timestamp'] >= earliest_time:
-            idx -= 1
-        self._load_statistics = self._load_statistics[idx+1:]
-        return self._load_statistics
+        return {
+            'num_free_blocks': self.kv_cache_manager.get_num_free_blocks(),
+            'n_waitings': len(self.waiting_attainable) + len(self.waiting_kv_xfer),
+            'n_running': len(self.running)
+        }
 
     def reset(self, profile_events: dict | None = None):
         logger.info('SchedulerAdmCtrl::reset')
@@ -665,9 +664,9 @@ class SchedulerAdmCtrl(SchedulerInterface):
             rejected_reqs.extend(self.waiting_attainable[self.scheduler_config.queue_length_threshold:])
             self.waiting_attainable = self.waiting_attainable[:self.scheduler_config.queue_length_threshold]
             
-        if 'edf' in self.scheduler_config.scheduling_policy:
-            self.waiting_attainable = sorted(self.waiting_attainable,\
-                key= lambda r: r.sampling_params.extra_args['slo_ttft'] + r.arrival_time)
+        # if 'edf' in self.scheduler_config.scheduling_policy:
+        #     self.waiting_attainable = sorted(self.waiting_attainable,\
+        #         key= lambda r: r.sampling_params.extra_args['slo_ttft'] + r.arrival_time)
         
         if 'sarathi' in self.scheduler_config.scheduling_policy:
             # prioritize decode requests
@@ -808,16 +807,6 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 num_decode_steps = 1
             )
             self._timer.stop('shortcut')
-            self._load_statistics.append({
-                'type': 'slosserve',
-                'timestamp': time.time(),
-                'future_batches': [{
-                    'n_tokens': len(self.running),
-                    'prefill_bs': bs - len(self.running),
-                    'estimated_time': self.scheduler_config.slo_tpot,
-                    'next': 0
-                }]
-            })
             self._exec_plan = ExecPlan()
             num_computed_tokens = [(req.request_id, req.num_computed_tokens) for req in self.running]
             now = time.time()
@@ -1052,13 +1041,6 @@ class SchedulerAdmCtrl(SchedulerInterface):
         
         self._timer = Timer()
         
-        self._load_statistics.append({
-            'type': 'pool',
-            'timestamp': time.time(),
-            'waiting_size': len(self.waiting_attainable),
-            'running_size': len(self.running)
-        })
-
         
         # num_scheduled_tokens: dict[str, int] = {}
         # token_budget = self.max_num_scheduled_tokens
@@ -1089,6 +1071,10 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 "kv_ready_time": request.kv_transfer_params.get('arrival_time', None),
                 "timestamp": time.time(),
             })
+            
+            if self.scheduler_config.scheduling_policy == 'atfc':
+                self.atfc_planner.request_arrive(request.request_id)
+            
             self.waiting_kv_xfer.remove(request)
             if self.policy == SchedulingPolicy.FCFS:
                 self.waiting_attainable.append(request)
@@ -1531,11 +1517,6 @@ class SchedulerAdmCtrl(SchedulerInterface):
         elapsed_time: float = 0.0,
     ) -> dict[int, EngineCoreOutputs]:
         
-        
-        for stat in self._load_statistics[::-1]:
-            if stat['type'] == 'slosserve':
-                stat.update({'elapsed': elapsed_time})
-        
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1819,6 +1800,17 @@ class SchedulerAdmCtrl(SchedulerInterface):
             num_external_computed_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens))
+        self._profile_events.append({
+            'event_type': 'add_request_sch',
+            'timestamp': time.time(),
+            'request_id': request.request_id, 
+            'extra_args': {
+                'load_kv_async': load_kv_async,
+                'num_external_computed_tokens': num_external_computed_tokens,
+                'num_new_local_computed_tokens': num_new_local_computed_tokens,
+                'kv_transfer_params': request.kv_transfer_params
+            }
+        })
         timer.stop('get_num_new_matched_tokens')
         if self.scheduler_config.scheduling_policy == 'atfc':
             if self.scheduler_config.admission_mode == "off":
@@ -1901,6 +1893,11 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     return False
             if self.policy == SchedulingPolicy.FCFS:
                 self.waiting_attainable.append(request)
+            elif 'edf' in self.scheduler_config.scheduling_policy:
+                # this is the QLM implementation to reorder the queue by prioritizing the early ddl jobs;
+                ddls = [self._get_prefill_ddl(req) for req in self.waiting_attainable]
+                idx = bisect.bisect_right(ddls, self._get_prefill_ddl(request))
+                self.waiting_attainable.insert(idx, request)
             else:
                 assert self.policy == SchedulingPolicy.PRIORITY
                 idx = 0

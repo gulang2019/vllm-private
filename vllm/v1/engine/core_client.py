@@ -183,6 +183,10 @@ class EngineCoreClient(ABC):
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
+    async def add_request_with_admission_async(
+            self, request: EngineCoreRequest) -> bool:
+        raise NotImplementedError
+
     async def profile_async(self, is_start: bool = True) -> None:
         raise NotImplementedError
 
@@ -822,7 +826,8 @@ class AsyncMPClient(MPClient):
                             return
                         await output_handler(_self, outputs)
 
-                    if outputs.outputs or outputs.scheduler_stats:
+                    if (outputs.outputs or outputs.scheduler_stats
+                            or outputs.engine_state_snapshot is not None):
                         outputs_queue.put_nowait(outputs)
             except Exception as e:
                 outputs_queue.put_nowait(e)
@@ -894,7 +899,8 @@ class AsyncMPClient(MPClient):
         self._ensure_output_queue_task()
         return await future
     
-    async def get_load_statistics_async(self, t: float = 1) -> list[dict[str, Any]]:
+    async def get_load_statistics_async(self,
+                                        t: float = 1) -> dict[str, Any]:
         return await self.call_utility_async("get_load_statistics", t)
     
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
@@ -904,6 +910,26 @@ class AsyncMPClient(MPClient):
         request.client_index = self.client_index
         await self._send_input(EngineCoreRequestType.ADD, request)
         self._ensure_output_queue_task()
+
+    async def add_request_with_admission_async(
+            self, request: EngineCoreRequest) -> bool:
+        request.client_index = self.client_index
+        call_id = uuid.uuid1().int >> 64
+        request.admission_call_id = call_id
+        future = asyncio.get_running_loop().create_future()
+        self.utility_results[call_id] = future
+        try:
+            await self._send_input(EngineCoreRequestType.ADD, request)
+        except Exception:
+            self.utility_results.pop(call_id, None)
+            request.admission_call_id = 0
+            raise
+
+        self._ensure_output_queue_task()
+        try:
+            return await future
+        finally:
+            request.admission_call_id = 0
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
@@ -1114,6 +1140,37 @@ class DPAsyncMPClient(AsyncMPClient):
         await to_await
 
         self._ensure_output_queue_task()
+
+    async def add_request_with_admission_async(
+            self, request: EngineCoreRequest) -> bool:
+        self._ensure_stats_update_task()
+
+        request.current_wave = self.current_wave
+        request.client_index = self.client_index
+        call_id = uuid.uuid1().int >> 64
+        request.admission_call_id = call_id
+
+        chosen_engine = self.get_core_engine_for_request(request)
+        future = asyncio.get_running_loop().create_future()
+        self.utility_results[call_id] = future
+        try:
+            to_await = self._send_input(EngineCoreRequestType.ADD, request,
+                                        chosen_engine)
+            if not self.engines_running:
+                req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engine))
+                await self.first_req_send_socket.send(req_msg)
+
+            await to_await
+        except Exception:
+            self.utility_results.pop(call_id, None)
+            request.admission_call_id = 0
+            raise
+
+        self._ensure_output_queue_task()
+        try:
+            return await future
+        finally:
+            request.admission_call_id = 0
 
     def get_core_engine_for_request(self, request: EngineCoreRequest):
         return self.core_engine

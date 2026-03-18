@@ -165,6 +165,8 @@ class EngineCore:
         # Hacking to get the profile events into the scheduler
         self.scheduler._profile_events = self._profile_events
         self.batch_id = 0
+        self._scheduler_state_lock = threading.Lock()
+        self._allow_immediate_add_requests = threading.Event()
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -229,7 +231,153 @@ class EngineCore:
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
 
-    def add_request(self, request: Request, request_wave: int = 0):
+    @contextmanager
+    def _immediate_add_request_window(self) -> Generator[None, None, None]:
+        self._allow_immediate_add_requests.set()
+        try:
+            yield
+        finally:
+            self._allow_immediate_add_requests.clear()
+
+    @staticmethod
+    def _normalize_load_stats(load_stats: Any | None) -> dict[str, int]:
+        normalized = {
+            "num_free_blocks": 0,
+            "n_waitings": 0,
+            "n_running": 0,
+        }
+        if not isinstance(load_stats, dict):
+            return normalized
+
+        for key, default_value in normalized.items():
+            value = load_stats.get(key, default_value)
+            try:
+                normalized[key] = int(value)
+            except (TypeError, ValueError):
+                normalized[key] = default_value
+        return normalized
+
+    def _get_scheduler_exec_plan_snapshot(self) -> Optional[dict[str, Any]]:
+        getter = getattr(self.scheduler, "get_exec_plan", None)
+        if not callable(getter):
+            return None
+
+        try:
+            exec_plan = getter()
+        except Exception:
+            return None
+
+        if exec_plan is None:
+            return None
+
+        snapshot: dict[str, Any] = {
+            "req_plans": {},
+            "batch_times": [],
+            "num_free_blocks": None,
+        }
+
+        req_plans = getattr(exec_plan, "req_plans", None)
+        if isinstance(req_plans, dict):
+            normalized_req_plans: dict[str, list[tuple[int, int]]] = {}
+            for req_id, req_plan in req_plans.items():
+                if not isinstance(req_plan, list):
+                    continue
+                normalized_steps: list[tuple[int, int]] = []
+                for step in req_plan:
+                    if not isinstance(step, (list, tuple)) or len(step) != 2:
+                        continue
+                    try:
+                        normalized_steps.append((int(step[0]), int(step[1])))
+                    except (TypeError, ValueError):
+                        continue
+                normalized_req_plans[str(req_id)] = normalized_steps
+            snapshot["req_plans"] = normalized_req_plans
+
+        batch_times = getattr(exec_plan, "batch_times", None)
+        if isinstance(batch_times, list):
+            snapshot["batch_times"] = [
+                float(batch_time) for batch_time in batch_times
+                if isinstance(batch_time, (int, float))
+            ]
+
+        num_free_blocks = getattr(exec_plan, "num_free_blocks", None)
+        if num_free_blocks is not None:
+            try:
+                snapshot["num_free_blocks"] = int(num_free_blocks)
+            except (TypeError, ValueError):
+                snapshot["num_free_blocks"] = None
+
+        return snapshot
+
+    def _get_scheduler_load_stats_snapshot(
+            self, t: float = 1) -> dict[str, int]:
+        getter = getattr(self.scheduler, "get_load_statistics", None)
+        if callable(getter):
+            try:
+                return self._normalize_load_stats(getter(t))
+            except TypeError:
+                try:
+                    return self._normalize_load_stats(getter())
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        waiting = 0
+        if hasattr(self.scheduler, "waiting"):
+            try:
+                waiting = len(self.scheduler.waiting)
+            except TypeError:
+                waiting = 0
+        else:
+            for attr in ("waiting_attainable", "waiting_kv_xfer"):
+                queue = getattr(self.scheduler, attr, None)
+                if queue is None:
+                    continue
+                try:
+                    waiting += len(queue)
+                except TypeError:
+                    continue
+
+        running = 0
+        if hasattr(self.scheduler, "running"):
+            try:
+                running = len(self.scheduler.running)
+            except TypeError:
+                running = 0
+
+        num_free_blocks = 0
+        kv_cache_manager = getattr(self.scheduler, "kv_cache_manager", None)
+        if kv_cache_manager is not None:
+            get_num_free_blocks = getattr(kv_cache_manager,
+                                          "get_num_free_blocks", None)
+            if callable(get_num_free_blocks):
+                try:
+                    num_free_blocks = get_num_free_blocks()
+                except Exception:
+                    num_free_blocks = 0
+
+        return self._normalize_load_stats({
+            "num_free_blocks": num_free_blocks,
+            "n_waitings": waiting,
+            "n_running": running,
+        })
+
+    def _make_engine_state_snapshot(self) -> dict[str, Any]:
+        return {
+            "exec_plan": self._get_scheduler_exec_plan_snapshot(),
+            "load_stats": self._get_scheduler_load_stats_snapshot(),
+        }
+
+    def _publish_engine_state_snapshot(self,
+                                       engine_state_snapshot: dict[str, Any],
+                                       client_index: int = 0) -> None:
+        self.output_queue.put_nowait((client_index,
+                                      EngineCoreOutputs(
+                                          engine_state_snapshot=
+                                          engine_state_snapshot)))
+
+    def add_request(self, request: Request, request_wave: int = 0) -> bool:
         """Add request to the scheduler.
         
         `request_wave`: indicate which wave of requests this is expected to
@@ -294,6 +442,9 @@ class EngineCore:
                 "finish_reason": "rejected-arrival",
                 "scheduling_overhead": scheduler_overhead,
             })
+            return False
+
+        return True
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -433,18 +584,23 @@ class EngineCore:
         was executed.
         """
 
-        # Check for any requests remaining in the scheduler - unfinished,
-        # or finished and not yet removed from the batch.
-        if not self.scheduler.has_requests():
-            return {}, False
-        start = time.time()
-        self.batch_id += 1
-        self.scheduler.batch_id = self.batch_id
-        scheduler_output = self.scheduler.schedule()
-        scheduling_overhead = time.time() - start
-        
+        with self._scheduler_state_lock:
+            # Check for any requests remaining in the scheduler - unfinished,
+            # or finished and not yet removed from the batch.
+            if not self.scheduler.has_requests():
+                return {}, False
+            start = time.time()
+            self.batch_id += 1
+            self.scheduler.batch_id = self.batch_id
+            scheduler_output = self.scheduler.schedule()
+            scheduling_overhead = time.time() - start
+            rejected_reqs = list(self.scheduler.get_rejected_requests())
+            engine_state_snapshot = self._make_engine_state_snapshot()
+
+        self._publish_engine_state_snapshot(engine_state_snapshot)
+
         rejected_outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
-        for req in self.scheduler.get_rejected_requests():
+        for req in rejected_reqs:
             self._profile_events.append({
                 "event_type": "finish",
                 "request_id": req.request_id,
@@ -467,9 +623,10 @@ class EngineCore:
 
         # print(f"Schedule[{self._timestamp[0]}]: {scheduler_output}")
         try:
-            model_output = self.execute_model_with_error_logging(
-                self.model_executor.execute_model,  # type: ignore
-                scheduler_output)
+            with self._immediate_add_request_window():
+                model_output = self.execute_model_with_error_logging(
+                    self.model_executor.execute_model,  # type: ignore
+                    scheduler_output)
         except Exception as e:
             self.dump_profile_events(f'engine_core_{self.vllm_config.parallel_config.data_parallel_rank}.events.jsonl')
             logger.error(f"Exception in execute_model_with_error_logging: {e}", exc_info=True)
@@ -488,8 +645,9 @@ class EngineCore:
             "scheduling_overhead": scheduling_overhead,
         })
         
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output, elapsed_time=elasped)  # type: ignore
+        with self._scheduler_state_lock:
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output, elapsed_time=elasped)  # type: ignore
         
         for output in engine_core_outputs.values():
             for req_output in output.outputs:
@@ -535,8 +693,8 @@ class EngineCore:
         logger.info(f'Scheduler config updated: {self.scheduler.scheduler_config}')
         self.scheduler.reset(self._profile_events)
         
-    def get_load_statistics(self, t: float = 1) -> list[dict[str, Any]]:
-        return self.scheduler.get_load_statistics(t)
+    def get_load_statistics(self, t: float = 1) -> dict[str, Any]:
+        return self._get_scheduler_load_stats_snapshot(t)
 
     def post_step(self, model_executed: bool) -> None:
         if self.use_spec_decode and model_executed:
@@ -568,7 +726,10 @@ class EngineCore:
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
         if not self.batch_queue.full():
-            scheduler_output = self.scheduler.schedule()
+            with self._scheduler_state_lock:
+                scheduler_output = self.scheduler.schedule()
+                engine_state_snapshot = self._make_engine_state_snapshot()
+            self._publish_engine_state_snapshot(engine_state_snapshot)
             if scheduler_output.total_num_scheduled_tokens > 0:
                 future = self.model_executor.execute_model(scheduler_output)
                 self.batch_queue.put_nowait(
@@ -587,12 +748,14 @@ class EngineCore:
             future, scheduler_output = self.batch_queue.get_nowait()
 
             # Blocking until the first result is available.
-            model_output = self.execute_model_with_error_logging(
-                lambda _: future.result(), scheduler_output)
+            with self._immediate_add_request_window():
+                model_output = self.execute_model_with_error_logging(
+                    lambda _: future.result(), scheduler_output)
 
             self.batch_queue.task_done()
-            engine_core_outputs = (self.scheduler.update_from_output(
-                scheduler_output, model_output))
+            with self._scheduler_state_lock:
+                engine_core_outputs = (self.scheduler.update_from_output(
+                    scheduler_output, model_output))
 
         return engine_core_outputs, scheduled_batch
 
@@ -1035,13 +1198,39 @@ class EngineCoreProc(EngineCore):
 
         return model_executed
 
+    def _publish_add_request_result(self, client_index: int, call_id: int,
+                                    admitted: bool) -> None:
+        if call_id == 0:
+            return
+
+        self.output_queue.put_nowait(
+            (client_index,
+             EngineCoreOutputs(utility_output=UtilityOutput(
+                 call_id, result=UtilityResult(admitted)))))
+
+    def _handle_add_request(self, request: Any) -> bool:
+        req, request_wave, client_index, call_id = request
+        admitted = self.add_request(req, request_wave)
+        self._publish_add_request_result(client_index, call_id, admitted)
+        return admitted
+
+    def _dispatch_input_request(self, request_type: EngineCoreRequestType,
+                                request: Any) -> None:
+        if (request_type == EngineCoreRequestType.ADD
+                and self._allow_immediate_add_requests.is_set()):
+            with self._scheduler_state_lock:
+                if self._allow_immediate_add_requests.is_set():
+                    self._handle_add_request(request)
+                    return
+
+        self.input_queue.put_nowait((request_type, request))
+
     def _handle_client_request(self, request_type: EngineCoreRequestType,
                                request: Any) -> None:
         """Dispatch request from client."""
 
         if request_type == EngineCoreRequestType.ADD:
-            req, request_wave = request
-            self.add_request(req, request_wave)
+            self._handle_add_request(request)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
@@ -1147,12 +1336,16 @@ class EngineCoreProc(EngineCore):
                     # Deserialize the request data.
                     if request_type == EngineCoreRequestType.ADD:
                         request = add_request_decoder.decode(data_frames)
-                        request = self.preprocess_add_request(request)
+                        client_index = request.client_index
+                        admission_call_id = request.admission_call_id
+                        req, request_wave = self.preprocess_add_request(
+                            request)
+                        request = (req, request_wave, client_index,
+                                   admission_call_id)
                     else:
                         request = generic_decoder.decode(data_frames)
 
-                    # Push to input queue for core busy loop.
-                    self.input_queue.put_nowait((request_type, request))
+                    self._dispatch_input_request(request_type, request)
 
     def process_output_sockets(self, output_paths: list[str],
                                coord_output_path: Optional[str],
@@ -1268,7 +1461,7 @@ class DPEngineCoreProc(EngineCoreProc):
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
-    def add_request(self, request: Request, request_wave: int = 0):
+    def add_request(self, request: Request, request_wave: int = 0) -> bool:
         if self.has_coordinator and request_wave != self.current_wave:
             if request_wave > self.current_wave:
                 self.current_wave = request_wave
@@ -1278,7 +1471,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 self.output_queue.put_nowait(
                     (-1, EngineCoreOutputs(start_wave=self.current_wave)))
 
-        super().add_request(request, request_wave)
+        return super().add_request(request, request_wave)
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
                                request: Any) -> None:
