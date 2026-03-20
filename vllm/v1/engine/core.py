@@ -165,6 +165,9 @@ class EngineCore:
         # Hacking to get the profile events into the scheduler
         self.scheduler._profile_events = self._profile_events
         self.batch_id = 0
+        # Delay batch event emission until the next schedule point so
+        # batch.elapsed reflects the interval between two scheduling points.
+        self._pending_batch_event: Optional[dict[str, Any]] = None
         self._scheduler_state_lock = threading.Lock()
         self._allow_immediate_add_requests = threading.Event()
 
@@ -377,6 +380,117 @@ class EngineCore:
                                           engine_state_snapshot=
                                           engine_state_snapshot)))
 
+    @staticmethod
+    def _get_request_sampling_extra_args(request: Request) -> dict[str, Any]:
+        sampling_params = getattr(request, "sampling_params", None)
+        extra_args = getattr(sampling_params, "extra_args", None)
+        return extra_args if isinstance(extra_args, dict) else {}
+
+    def _get_request_prefill_ddl(self, request: Request) -> float:
+        prefill_ddl = getattr(request, "prefill_ddl", None)
+        if prefill_ddl is not None:
+            try:
+                return float(prefill_ddl)
+            except (TypeError, ValueError):
+                pass
+
+        getter = getattr(self.scheduler, "_get_prefill_ddl", None)
+        if callable(getter):
+            try:
+                return float(getter(request))
+            except Exception:
+                pass
+
+        extra_args = self._get_request_sampling_extra_args(request)
+        if "prefill_ddl" in extra_args:
+            try:
+                return float(extra_args["prefill_ddl"])
+            except (TypeError, ValueError):
+                pass
+
+        if "slo_ttft" in extra_args:
+            try:
+                return float(request.arrival_time) + float(
+                    extra_args["slo_ttft"])
+            except (TypeError, ValueError):
+                pass
+
+        return float(getattr(request, "arrival_time", time.time()))
+
+    def _get_estimated_batch_time(
+        self,
+        engine_state_snapshot: dict[str, Any],
+        scheduler_output: SchedulerOutput,
+        schedule_timestamp: float,
+    ) -> float:
+        exec_plan = engine_state_snapshot.get("exec_plan")
+        if isinstance(exec_plan, dict):
+            batch_times = exec_plan.get("batch_times")
+            if isinstance(batch_times, list) and batch_times:
+                try:
+                    return max(0.0, float(batch_times[0]) - schedule_timestamp)
+                except (TypeError, ValueError):
+                    pass
+
+        perf_model = getattr(self.scheduler, "perf_model", None)
+        get_batch_time = getattr(perf_model, "get_batch_time", None)
+        if not callable(get_batch_time):
+            return 0.0
+
+        batch: list[tuple[int, int]] = []
+        for new_req in scheduler_output.scheduled_new_reqs:
+            scheduled_tokens = scheduler_output.num_scheduled_tokens.get(
+                new_req.req_id, 0)
+            if scheduled_tokens > 0:
+                batch.append((new_req.num_computed_tokens, scheduled_tokens))
+
+        batch.extend(
+            (num_computed_tokens,
+             scheduler_output.num_scheduled_tokens.get(req_id, 0))
+            for req_id, num_computed_tokens in zip(
+                scheduler_output.scheduled_cached_reqs.req_ids,
+                scheduler_output.scheduled_cached_reqs.num_computed_tokens)
+            if scheduler_output.num_scheduled_tokens.get(req_id, 0) > 0)
+
+        if not batch:
+            return 0.0
+
+        try:
+            return float(get_batch_time(batch))
+        except Exception:
+            return 0.0
+
+    def _finalize_pending_batch_event(self, timestamp: float) -> None:
+        pending_event = self._pending_batch_event
+        if pending_event is None:
+            return
+
+        schedule_timestamp = float(
+            pending_event.pop("_schedule_timestamp", timestamp))
+        finalize_timestamp = max(float(timestamp), schedule_timestamp)
+        elapsed = max(0.0, finalize_timestamp - schedule_timestamp)
+
+        pending_event["timestamp"] = finalize_timestamp
+        pending_event["elapsed"] = elapsed
+        pending_event["between_batch_time"] = elapsed
+
+        self._profile_events.append(pending_event)
+        self._pending_batch_event = None
+
+    def _prepare_scheduler_batch_context(self) -> None:
+        self.batch_id += 1
+        self.scheduler.batch_id = self.batch_id
+
+        atfc_planner = getattr(self.scheduler, "atfc_planner", None)
+        if atfc_planner is None:
+            return
+
+        planner_device_id = getattr(
+            self, "engine_index",
+            self.vllm_config.parallel_config.data_parallel_rank)
+        atfc_planner.tag = f"{planner_device_id}_{self.batch_id}"
+        atfc_planner.batch_id = self.batch_id
+
     def add_request(self, request: Request, request_wave: int = 0) -> bool:
         """Add request to the scheduler.
         
@@ -409,25 +523,51 @@ class EngineCore:
         else:
             prefill_only = False
             decode_only = False
-            
-        
+        sampling_extra_args = self._get_request_sampling_extra_args(request)
+
         self._profile_events.append({
             "event_type": "arrival",
-            "zero_load_ttft": request.sampling_params.extra_args.get('zero_load_ttft', 0),
+            "zero_load_ttft": sampling_extra_args.get('zero_load_ttft', 0),
             "request_id": request.request_id,
             "prompt_tokens": request.num_prompt_tokens,
             "max_tokens": request.max_tokens,
             "timestamp": time.time(),
-            "prefill_ddl": request.prefill_ddl,
-            "profit": request.sampling_params.extra_args.get('profit', 1),
+            "prefill_ddl": self._get_request_prefill_ddl(request),
+            "profit": sampling_extra_args.get('profit', 1),
             "prefill_only": prefill_only,
             "decode_only": decode_only,
             "add_req_time": request.arrival_time,
+            "extra_args": {
+                "batch_id": self.batch_id,
+            },
         })
-        
-        
+
         suc = self.scheduler.add_request(request)
         scheduler_overhead = time.time() - start_time
+        now = time.time()
+        kv_transfer_params = sampling_extra_args.get('kv_transfer_params', {})
+        if not isinstance(kv_transfer_params, dict):
+            kv_transfer_params = {}
+
+        kv_ready_time = 0.0
+        try:
+            kv_ready_time = float(kv_transfer_params.get('arrival_time', now)
+                                  ) - now
+        except (TypeError, ValueError):
+            kv_ready_time = 0.0
+
+        self._profile_events.append({
+            "event_type": "add_request",
+            "request_id": request.request_id,
+            "timestamp": now,
+            "extra_args": {
+                "elapsed": now - start_time,
+                "kv_transfer_params": kv_transfer_params,
+                "kv_ready_time": kv_ready_time,
+                "admitted": suc,
+            },
+        })
+
         if not suc:
             request.status = RequestStatus.FINISHED_REJECTED
             self.output_queue.put_nowait((request.client_index, EngineCoreOutputs(outputs=[
@@ -585,19 +725,22 @@ class EngineCore:
         """
 
         with self._scheduler_state_lock:
+            schedule_timestamp = time.time()
+            self._finalize_pending_batch_event(schedule_timestamp)
+
             # Check for any requests remaining in the scheduler - unfinished,
             # or finished and not yet removed from the batch.
             if not self.scheduler.has_requests():
                 return {}, False
-            start = time.time()
-            self.batch_id += 1
-            self.scheduler.batch_id = self.batch_id
+            self._prepare_scheduler_batch_context()
             scheduler_output = self.scheduler.schedule()
-            scheduling_overhead = time.time() - start
+            scheduling_overhead = time.time() - schedule_timestamp
             rejected_reqs = list(self.scheduler.get_rejected_requests())
             engine_state_snapshot = self._make_engine_state_snapshot()
 
+        publish_start = time.time()
         self._publish_engine_state_snapshot(engine_state_snapshot)
+        publish_overhead = time.time() - publish_start
 
         rejected_outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         for req in rejected_reqs:
@@ -622,6 +765,7 @@ class EngineCore:
             self.output_queue.put_nowait(output)
 
         # print(f"Schedule[{self._timestamp[0]}]: {scheduler_output}")
+        launch_start = time.time()
         try:
             with self._immediate_add_request_window():
                 model_output = self.execute_model_with_error_logging(
@@ -631,23 +775,13 @@ class EngineCore:
             self.dump_profile_events(f'engine_core_{self.vllm_config.parallel_config.data_parallel_rank}.events.jsonl')
             logger.error(f"Exception in execute_model_with_error_logging: {e}", exc_info=True)
             raise e
-        elasped = time.time() - start
-        
-        
-        self._profile_events.append({
-            "event_type": "batch",
-            "batch_id": self.batch_id,
-            "timestamp": time.time(),
-            "elapsed": elasped,
-            "req_ids": [new_req.req_id for new_req in scheduler_output.scheduled_new_reqs] + scheduler_output.scheduled_cached_reqs.req_ids,
-            "num_computed_tokens": [new_req.num_computed_tokens for new_req in scheduler_output.scheduled_new_reqs] + scheduler_output.scheduled_cached_reqs.num_computed_tokens,
-            "num_scheduled_tokens": scheduler_output.num_scheduled_tokens,
-            "scheduling_overhead": scheduling_overhead,
-        })
-        
+        output_processing_start = time.time()
+        step_elapsed = output_processing_start - schedule_timestamp
+
         with self._scheduler_state_lock:
             engine_core_outputs = self.scheduler.update_from_output(
-                scheduler_output, model_output, elapsed_time=elasped)  # type: ignore
+                scheduler_output, model_output,
+                elapsed_time=step_elapsed)  # type: ignore
         
         for output in engine_core_outputs.values():
             for req_output in output.outputs:
@@ -659,6 +793,40 @@ class EngineCore:
                         "timestamp": time.time(),
                         "finish_reason": str(req_output.finish_reason),
                     })
+
+        output_processing_elapsed = time.time() - output_processing_start
+
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            estimated_time = self._get_estimated_batch_time(
+                engine_state_snapshot, scheduler_output, schedule_timestamp)
+            launch_offset = max(0.0, launch_start - schedule_timestamp)
+            finish_offset = max(0.0,
+                                output_processing_start - schedule_timestamp)
+
+            self._pending_batch_event = {
+                "event_type": "batch",
+                "batch_id": self.batch_id,
+                "req_ids": [new_req.req_id for new_req in
+                            scheduler_output.scheduled_new_reqs]
+                + scheduler_output.scheduled_cached_reqs.req_ids,
+                "num_computed_tokens": [
+                    new_req.num_computed_tokens
+                    for new_req in scheduler_output.scheduled_new_reqs
+                ] + scheduler_output.scheduled_cached_reqs.num_computed_tokens,
+                "num_scheduled_tokens": scheduler_output.num_scheduled_tokens,
+                "scheduling_overhead": scheduling_overhead,
+                "output_processing_elapsed": output_processing_elapsed,
+                "estimated_time": estimated_time,
+                "rejected_reqs": [req.request_id for req in rejected_reqs],
+                "publish_overhead": publish_overhead,
+                "extra_args": {
+                    "to_schedule": 0.0,
+                    "to_launch": launch_offset,
+                    "to_finish": finish_offset,
+                    "to_est_finish": launch_offset + estimated_time,
+                },
+                "_schedule_timestamp": schedule_timestamp,
+            }
                 
         return (engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0)
@@ -667,6 +835,7 @@ class EngineCore:
         if self.vllm_config.parallel_config.data_parallel_rank != dp_rank:
             return
         logger.info(f'[DP{dp_rank}] dumping profile events to {filename}')
+        self._finalize_pending_batch_event(time.time())
         if hasattr(self.scheduler, '_req_cached_tokens'):
             for event in self._profile_events:
                 if event['event_type'] == 'arrival':
@@ -683,6 +852,7 @@ class EngineCore:
         logger.info(f'[DP{dp_rank}] updating config with {config}')
         
         self._profile_events = []
+        self._pending_batch_event = None
         for k, v in config.items():
             if isinstance(v, dict):
                 for kk, vv in v.items():
@@ -727,6 +897,7 @@ class EngineCore:
         # Note that this is not blocking.
         if not self.batch_queue.full():
             with self._scheduler_state_lock:
+                self._prepare_scheduler_batch_context()
                 scheduler_output = self.scheduler.schedule()
                 engine_state_snapshot = self._make_engine_state_snapshot()
             self._publish_engine_state_snapshot(engine_state_snapshot)
