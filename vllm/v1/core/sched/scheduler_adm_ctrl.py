@@ -308,18 +308,33 @@ class SchedulerAdmCtrl(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
-        from SLOsServe.perf_model import PerfModel
-        self.perf_model = PerfModel.get_perf_model(self.scheduler_config.model_name, self.scheduler_config.length_pattern)
+        authentic_perf_model = self._load_authentic_perf_model()
+        self.authentic_perf_model = authentic_perf_model
+        self.execution_perf_model = self._build_execution_perf_model(
+            authentic_perf_model)
+        self.perf_model = self._build_control_perf_model(authentic_perf_model)
         self.slosserve_scheduler = SLOsServe_C.AdmCtrlScheduler(self.scheduler_config.scheduling_policy, self.block_size, False, False)
-        self.perf_model.hardware_params[4] += self.scheduler_config.scheduling_overhead + PERF_MODEL_HEADROOM
         self.slosserve_scheduler.set_ar_planner(
             tpots = [self.get_tpot_slo()],
             hardware_params = self.perf_model.hardware_params,
             fixed_bs = False,
             max_bs = self.scheduler_config.max_num_batched_tokens
         )
-        logger.info(f'fetching perf model for model_name: {self.scheduler_config.model_name} and length_pattern: {self.scheduler_config.length_pattern}')
-        logger.info(f'updating slosserve scheduler with TPOT: {self.get_tpot_slo()} and hardware_params: {self.perf_model.hardware_params}')
+        logger.info(
+            'fetching perf model for model_name: %s and length_pattern: %s, perf model err: %s',
+            self.scheduler_config.model_name,
+            self.scheduler_config.length_pattern,
+            self.scheduler_config.perf_model_err,
+        )
+        logger.info(
+            'updating slosserve scheduler with TPOT: %s and control hardware_params: %s',
+            self.get_tpot_slo(),
+            self.perf_model.hardware_params,
+        )
+        logger.info(
+            'using execution hardware_params: %s',
+            self.execution_perf_model.hardware_params,
+        )
         if self.scheduler_config.scheduling_policy in ["dp", "edf"]:
             self.stateless_schedule_fn = self._schedule_stateless_slosserve
         elif self.scheduler_config.scheduling_policy == 'atfc':
@@ -329,7 +344,8 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 _max_lookahead = 100,
                 _num_free_blocks = self.kv_cache_manager.get_num_free_blocks(),
                 _block_size = self.cache_config.block_size,
-                _max_decode_length = self.scheduler_config.max_decoding_length
+                _max_decode_length = self.scheduler_config.max_decoding_length,
+                _max_batch_size = self.max_num_scheduled_tokens,
             )
         elif 'vllm' in self.scheduler_config.scheduling_policy:
             self.stateless_schedule_fn = self._schedule_stateless_vllm
@@ -337,9 +353,9 @@ class SchedulerAdmCtrl(SchedulerInterface):
             raise ValueError(f"Unknown admission policy: {self.scheduler_config.scheduling_policy}")
         
         if self.vllm_config.is_simulation == 'logical':
-            self.timer = LogicalTimer(self.perf_model)
+            self.timer = LogicalTimer(self.execution_perf_model)
         elif self.vllm_config.is_simulation == 'emulate':
-            self.timer = EnumlateTimer(self.perf_model)
+            self.timer = EnumlateTimer(self.execution_perf_model)
         else:
             self.timer = DefaultTimer()
         logger.info(f"Timer: {self.timer}")
@@ -350,6 +366,26 @@ class SchedulerAdmCtrl(SchedulerInterface):
         print('kv cache manager initialized', self.kv_cache_manager)
         self._timer = Timer()
         self._exec_plan = None
+
+    def _load_authentic_perf_model(self):
+        from SLOsServe.perf_model import PerfModel
+
+        return PerfModel.get_perf_model(
+            self.scheduler_config.model_name,
+            self.scheduler_config.length_pattern,
+        )
+
+    def _build_control_perf_model(self, authentic_perf_model):
+        return authentic_perf_model.copy_with_adjustments(
+            scale=self.scheduler_config.perf_model_err,
+            constant_offset=self.scheduler_config.scheduling_overhead
+            + PERF_MODEL_HEADROOM,
+        )
+
+    def _build_execution_perf_model(self, authentic_perf_model):
+        return authentic_perf_model.copy_with_adjustments(
+            constant_offset=self.scheduler_config.scheduling_overhead,
+        )
             
     def get_load_statistics(self, t: float = 5) -> list[dict[str, Any]]:
         return {
@@ -471,10 +507,11 @@ class SchedulerAdmCtrl(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
-        from SLOsServe.perf_model import PerfModel
-        self.perf_model = PerfModel.get_perf_model(self.scheduler_config.model_name, self.scheduler_config.length_pattern)
-        self.perf_model.hardware_params[4] += self.scheduler_config.scheduling_overhead
-        self.perf_model.hardware_params = [x * self.scheduler_config.perf_model_err for x in self.perf_model.hardware_params]
+        authentic_perf_model = self._load_authentic_perf_model()
+        self.authentic_perf_model = authentic_perf_model
+        self.execution_perf_model = self._build_execution_perf_model(
+            authentic_perf_model)
+        self.perf_model = self._build_control_perf_model(authentic_perf_model)
         self.slosserve_scheduler = SLOsServe_C.AdmCtrlScheduler(self.scheduler_config.scheduling_policy, self.block_size, False, False)
         self.slosserve_scheduler.set_ar_planner(
             tpots = [self.get_tpot_slo()],
@@ -482,8 +519,21 @@ class SchedulerAdmCtrl(SchedulerInterface):
             fixed_bs = False,
             max_bs = self.scheduler_config.max_num_batched_tokens
         )
-        logger.info(f'fetching perf model for model_name: {self.scheduler_config.model_name} and length_pattern: {self.scheduler_config.length_pattern}, perf model err: {self.scheduler_config.perf_model_err}')
-        logger.info(f'updating slosserve scheduler with TPOT: {self.get_tpot_slo()} and hardware_params: {self.perf_model.hardware_params}')
+        logger.info(
+            'fetching perf model for model_name: %s and length_pattern: %s, perf model err: %s',
+            self.scheduler_config.model_name,
+            self.scheduler_config.length_pattern,
+            self.scheduler_config.perf_model_err,
+        )
+        logger.info(
+            'updating slosserve scheduler with TPOT: %s and control hardware_params: %s',
+            self.get_tpot_slo(),
+            self.perf_model.hardware_params,
+        )
+        logger.info(
+            'using execution hardware_params: %s',
+            self.execution_perf_model.hardware_params,
+        )
         if self.scheduler_config.scheduling_policy in ["dp", "edf"]:
             self.stateless_schedule_fn = self._schedule_stateless_slosserve
         elif self.scheduler_config.scheduling_policy == 'atfc':
@@ -494,6 +544,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 _num_free_blocks = self.kv_cache_manager.get_num_free_blocks(),
                 _block_size = self.cache_config.block_size,
                 _max_decode_length = self.scheduler_config.max_decoding_length,
+                _max_batch_size = self.max_num_scheduled_tokens,
                 _profile_events = self._profile_events
             )
         elif 'vllm' in self.scheduler_config.scheduling_policy:
@@ -502,9 +553,9 @@ class SchedulerAdmCtrl(SchedulerInterface):
             raise ValueError(f"Unknown admission policy: {self.scheduler_config.scheduling_policy}")
         
         if self.vllm_config.is_simulation == 'logical':
-            self.timer = LogicalTimer(self.perf_model)
+            self.timer = LogicalTimer(self.execution_perf_model)
         elif self.vllm_config.is_simulation == 'emulate':
-            self.timer = EnumlateTimer(self.perf_model)
+            self.timer = EnumlateTimer(self.execution_perf_model)
         else:
             self.timer = DefaultTimer()
         logger.info(f"Timer: {self.timer}")
@@ -1235,7 +1286,13 @@ class SchedulerAdmCtrl(SchedulerInterface):
         
         scheduled_resumed_reqs = list(resumed_reqs)
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        
+        if total_num_scheduled_tokens > self.max_num_scheduled_tokens:
+            raise RuntimeError(
+                "SchedulerAdmCtrl produced "
+                f"{total_num_scheduled_tokens} scheduled tokens, which "
+                "exceeds max_num_batched_tokens="
+                f"{self.max_num_scheduled_tokens}.")
+
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
         num_common_prefix_blocks = [0] * len(

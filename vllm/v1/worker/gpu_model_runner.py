@@ -702,6 +702,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
+        if total_num_scheduled_tokens > self.max_num_tokens:
+            raise ValueError(
+                "Scheduler produced more tokens than the GPU model runner "
+                "buffers can hold: "
+                f"total_num_scheduled_tokens={total_num_scheduled_tokens}, "
+                f"max_num_batched_tokens={self.max_num_tokens}.")
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
