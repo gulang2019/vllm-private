@@ -71,12 +71,15 @@ class PyNcclCommunicator:
 
         if self.rank == 0:
             # get the unique id from NCCL
+            logger.info("PyNccl rank %d generating NCCL unique id", self.rank)
             self.unique_id = self.nccl.ncclGetUniqueId()
         else:
             # construct an empty unique id
+            logger.info("PyNccl rank %d waiting for NCCL unique id", self.rank)
             self.unique_id = ncclUniqueId()
 
         if not isinstance(group, StatelessProcessGroup):
+            logger.info("PyNccl rank %d broadcasting NCCL unique id", self.rank)
             tensor = torch.ByteTensor(list(self.unique_id.internal))
             ranks = dist.get_process_group_ranks(group)
             # arg `src` in `broadcast` is the global rank
@@ -84,8 +87,10 @@ class PyNcclCommunicator:
             byte_list = tensor.tolist()
             for i, byte in enumerate(byte_list):
                 self.unique_id.internal[i] = byte
+            logger.info("PyNccl rank %d received NCCL unique id", self.rank)
         else:
             self.unique_id = group.broadcast_obj(self.unique_id, src=0)
+            logger.info("PyNccl rank %d received NCCL unique id", self.rank)
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
         elif isinstance(device, str):
@@ -97,15 +102,22 @@ class PyNcclCommunicator:
         # `torch.cuda.device` is a context manager that changes the
         # current cuda device to the specified one
         with torch.cuda.device(device):
+            logger.info("PyNccl rank %d calling ncclCommInitRank on %s",
+                        self.rank, device)
             self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
                 self.world_size, self.unique_id, self.rank)
+            logger.info("PyNccl rank %d initialized ncclComm", self.rank)
 
             stream = current_stream()
             # A small all_reduce for warmup.
+            logger.info("PyNccl rank %d starting NCCL warmup all_reduce",
+                        self.rank)
             data = torch.zeros(1, device=device)
             self.all_reduce(data)
             stream.synchronize()
             del data
+            logger.info("PyNccl rank %d finished NCCL warmup all_reduce",
+                        self.rank)
 
     def all_reduce(self,
                    in_tensor: torch.Tensor,
