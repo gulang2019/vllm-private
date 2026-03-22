@@ -4,7 +4,9 @@
 import copy
 import gc
 import os
+import subprocess
 from contextlib import AbstractContextManager, nullcontext
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -25,7 +27,8 @@ from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
-from vllm.utils import GiB_bytes, MemorySnapshot, memory_profiling
+from vllm.utils import (GiB_bytes, MemorySnapshot, find_nccl_library,
+                        memory_profiling)
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
@@ -56,6 +59,8 @@ _DEBUG_ENV_KEYS = (
     "NCCL_SOCKET_IFNAME",
     "VLLM_NCCL_SO_PATH",
     "VLLM_PORT",
+    "NCCL_NET",
+    "RANK"
 )
 
 
@@ -66,6 +71,46 @@ def _log_worker_env(rank: int) -> None:
         if key in os.environ
     }
     logger.info("Worker rank %d env snapshot: %s", rank, env_snapshot)
+
+
+def _log_worker_library_resolution(rank: int) -> None:
+    try:
+        resolved_nccl = find_nccl_library()
+    except Exception as exc:
+        logger.warning("Worker rank %d failed to resolve NCCL library: %r",
+                       rank, exc)
+        resolved_nccl = None
+
+    libtorch_cuda = (
+        Path(torch.__file__).resolve().parent / "lib" / "libtorch_cuda.so")
+    logger.info(
+        "Worker rank %d library resolution: torch.__file__=%s libtorch_cuda=%s "
+        "resolved_nccl=%s",
+        rank,
+        torch.__file__,
+        libtorch_cuda,
+        resolved_nccl,
+    )
+    if not libtorch_cuda.exists():
+        logger.warning("Worker rank %d libtorch_cuda.so not found at %s", rank,
+                       libtorch_cuda)
+        return
+
+    try:
+        ldd_output = subprocess.check_output(
+            ["ldd", str(libtorch_cuda)],
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        nccl_lines = [
+            line.strip() for line in ldd_output.splitlines()
+            if "nccl" in line.lower()
+        ]
+        logger.info("Worker rank %d libtorch_cuda.so nccl deps: %s", rank,
+                    nccl_lines or ["<none>"])
+    except Exception as exc:
+        logger.warning("Worker rank %d failed to inspect libtorch_cuda.so: %r",
+                       rank, exc)
 
 
 class Worker(WorkerBase):
@@ -181,6 +226,7 @@ class Worker(WorkerBase):
 
     def init_device(self):
         _log_worker_env(self.rank)
+        _log_worker_library_resolution(self.rank)
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
             # the synchronization point. This causes the memory usage to grow
