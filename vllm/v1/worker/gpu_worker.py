@@ -41,6 +41,33 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 
+_DEBUG_ENV_KEYS = (
+    "CUDA_VISIBLE_DEVICES",
+    "CUDA_DEVICE_ORDER",
+    "LD_LIBRARY_PATH",
+    "NCCL_IB_DISABLE",
+    "NCCL_P2P_DISABLE",
+    "NCCL_P2P_LEVEL",
+    "NCCL_CUMEM_ENABLE",
+    "NCCL_CUMEM_HOST_ENABLE",
+    "NCCL_DEBUG",
+    "NCCL_DEBUG_SUBSYS",
+    "NCCL_DEBUG_FILE",
+    "NCCL_SOCKET_IFNAME",
+    "VLLM_NCCL_SO_PATH",
+    "VLLM_PORT",
+)
+
+
+def _log_worker_env(rank: int) -> None:
+    env_snapshot = {
+        key: os.environ[key]
+        for key in _DEBUG_ENV_KEYS
+        if key in os.environ
+    }
+    logger.info("Worker rank %d env snapshot: %s", rank, env_snapshot)
+
+
 class Worker(WorkerBase):
 
     def __init__(
@@ -153,6 +180,7 @@ class Worker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def init_device(self):
+        _log_worker_env(self.rank)
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
             # the synchronization point. This causes the memory usage to grow
