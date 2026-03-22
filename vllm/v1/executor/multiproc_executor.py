@@ -39,6 +39,36 @@ from vllm.worker.worker_base import WorkerWrapperBase
 logger = init_logger(__name__)
 
 
+def _format_process_exit(proc: BaseProcess) -> str:
+    if hasattr(proc, "join"):
+        try:
+            proc.join(timeout=1.0)
+        except Exception:
+            pass
+
+    pid = getattr(proc, "pid", None)
+    exitcode = getattr(proc, "exitcode", None)
+
+    parts: list[str] = []
+    if pid is not None:
+        parts.append(f"pid={pid}")
+
+    if exitcode is None:
+        parts.append("exitcode=unknown")
+        return ", ".join(parts)
+
+    parts.append(f"exitcode={exitcode}")
+    if exitcode < 0:
+        signal_num = -exitcode
+        try:
+            signal_name = signal.Signals(signal_num).name
+        except ValueError:
+            signal_name = f"SIG{signal_num}"
+        parts.append(f"signal={signal_name}")
+
+    return ", ".join(parts)
+
+
 class MultiprocExecutor(Executor):
 
     supports_pp: bool = True
@@ -479,15 +509,14 @@ class WorkerProc:
                             unready_proc_handle, worker_response_mq))
 
                 except EOFError:
-                    exitcode = getattr(unready_proc_handle.proc, "exitcode",
-                                       None)
                     msg = (
                         "WorkerProc initialization failed because "
                         f"background worker rank {unready_proc_handle.rank} "
                         "exited before signaling READY."
                     )
-                    if exitcode is not None:
-                        msg += f" exitcode={exitcode}"
+                    exit_info = _format_process_exit(unready_proc_handle.proc)
+                    if exit_info:
+                        msg += f" {exit_info}"
                     raise RuntimeError(msg) from None
 
                 finally:
