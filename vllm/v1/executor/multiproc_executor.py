@@ -435,8 +435,12 @@ class WorkerProc:
         self.worker_response_mq = MessageQueue(1, 1)
 
         # Initialize device and loads weights
+        logger.info("Worker rank %d starting init_device()", self.rank)
         self.worker.init_device()
+        logger.info("Worker rank %d finished init_device()", self.rank)
+        logger.info("Worker rank %d starting load_model()", self.rank)
         self.worker.load_model()
+        logger.info("Worker rank %d finished load_model()", self.rank)
 
     @staticmethod
     def make_worker_process(

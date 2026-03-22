@@ -165,6 +165,8 @@ class Worker(WorkerBase):
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             self.device = torch.device(f"cuda:{self.local_rank}")
+            logger.info("Worker rank %d binding to device %s",
+                        self.rank, self.device)
             current_platform.set_device(self.device)
 
             _check_if_gpu_supports_dtype(self.model_config.dtype)
@@ -190,16 +192,22 @@ class Worker(WorkerBase):
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
         # Initialize the distributed environment.
+        logger.info("Worker rank %d starting distributed initialization",
+                    self.rank)
         init_worker_distributed_environment(self.vllm_config, self.rank,
                                             self.distributed_init_method,
                                             self.local_rank,
                                             current_platform.dist_backend)
+        logger.info("Worker rank %d finished distributed initialization",
+                    self.rank)
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
         # Construct the model runner
+        logger.info("Worker rank %d constructing GPUModelRunner", self.rank)
         self.model_runner: GPUModelRunner = GPUModelRunner(
             self.vllm_config, self.device)
+        logger.info("Worker rank %d constructed GPUModelRunner", self.rank)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -209,8 +217,10 @@ class Worker(WorkerBase):
     # to hijack tensor allocation.
     def load_model(self) -> None:
         eep_scale_up = os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1"
+        logger.info("Worker rank %d entering model weight load", self.rank)
         with self._maybe_get_memory_pool_context(tag="weights"):
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
+        logger.info("Worker rank %d finished model weight load", self.rank)
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
@@ -606,13 +616,17 @@ def init_worker_distributed_environment(
     parallel_config = vllm_config.parallel_config
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
 
+    logger.info("Worker rank %d calling init_distributed_environment", rank)
     init_distributed_environment(parallel_config.world_size, rank,
                                  distributed_init_method, local_rank, backend)
+    logger.info("Worker rank %d initialized torch distributed", rank)
 
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
+    logger.info("Worker rank %d initialized model parallel groups", rank)
 
     ensure_kv_transfer_initialized(vllm_config)
+    logger.info("Worker rank %d initialized KV transfer", rank)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
