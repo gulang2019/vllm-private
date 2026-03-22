@@ -358,6 +358,7 @@ class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
     READY_STR = "READY"
+    FAILURE_STR = "FAILURE"
 
     def __init__(
         self,
@@ -447,11 +448,6 @@ class WorkerProc:
     def wait_for_ready(
         unready_proc_handles: list[UnreadyWorkerProcHandle]
     ) -> list[WorkerProcHandle]:
-
-        e = Exception("WorkerProc initialization failed due to "
-                      "an exception in a background process. "
-                      "See stack trace for root cause.")
-
         pipes = {handle.ready_pipe: handle for handle in unready_proc_handles}
         ready_proc_handles: list[Optional[WorkerProcHandle]] = (
             [None] * len(unready_proc_handles))
@@ -464,7 +460,16 @@ class WorkerProc:
                     unready_proc_handle = pipes.pop(pipe)
                     response: dict[str, Any] = pipe.recv()
                     if response["status"] != "READY":
-                        raise e
+                        error = response.get("error", "unknown startup error")
+                        child_traceback = response.get("traceback")
+                        msg = (
+                            "WorkerProc initialization failed in "
+                            f"background worker rank {unready_proc_handle.rank}: "
+                            f"{error}"
+                        )
+                        if child_traceback:
+                            msg += f"\n\nWorker traceback:\n{child_traceback}"
+                        raise RuntimeError(msg)
 
                     # Extract the message queue handle.
                     worker_response_mq = MessageQueue.create_from_handle(
@@ -474,8 +479,16 @@ class WorkerProc:
                             unready_proc_handle, worker_response_mq))
 
                 except EOFError:
-                    e.__suppress_context__ = True
-                    raise e from None
+                    exitcode = getattr(unready_proc_handle.proc, "exitcode",
+                                       None)
+                    msg = (
+                        "WorkerProc initialization failed because "
+                        f"background worker rank {unready_proc_handle.rank} "
+                        "exited before signaling READY."
+                    )
+                    if exitcode is not None:
+                        msg += f" exitcode={exitcode}"
+                    raise RuntimeError(msg) from None
 
                 finally:
                     # Close connection.
@@ -555,7 +568,7 @@ class WorkerProc:
 
             worker.worker_busy_loop()
 
-        except Exception:
+        except Exception as exc:
             # NOTE: if an Exception arises in busy_loop, we send
             # a FAILURE message over the MQ RPC to notify the Executor,
             # which triggers system shutdown.
@@ -563,6 +576,18 @@ class WorkerProc:
 
             if ready_writer is not None:
                 logger.exception("WorkerProc failed to start.")
+                startup_traceback = traceback.format_exc()
+                error_summary = "".join(
+                    traceback.format_exception_only(type(exc), exc)).strip()
+                try:
+                    ready_writer.send({
+                        "status": WorkerProc.FAILURE_STR,
+                        "error": error_summary,
+                        "traceback": startup_traceback,
+                    })
+                except Exception:
+                    logger.exception(
+                        "Failed to report startup exception to parent.")
             else:
                 logger.exception("WorkerProc failed.")
 
