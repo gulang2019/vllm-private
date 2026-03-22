@@ -228,6 +228,9 @@ class SchedulerConfig:
     
     oracle_mem: bool = False
     """Whether the scheduler assumes knowledge on the decode length"""
+
+    ablation_no_local: bool = False
+    """Whether ATFC should force local admission regardless of feasibility."""
     
     def compute_hash(self) -> str:
         """

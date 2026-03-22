@@ -346,6 +346,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 _block_size = self.cache_config.block_size,
                 _max_decode_length = self.scheduler_config.max_decoding_length,
                 _max_batch_size = self.max_num_scheduled_tokens,
+                _is_oracle = self.scheduler_config.oracle_mem,
             )
         elif 'vllm' in self.scheduler_config.scheduling_policy:
             self.stateless_schedule_fn = self._schedule_stateless_vllm
@@ -545,6 +546,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 _block_size = self.cache_config.block_size,
                 _max_decode_length = self.scheduler_config.max_decoding_length,
                 _max_batch_size = self.max_num_scheduled_tokens,
+                _is_oracle = self.scheduler_config.oracle_mem,
                 _profile_events = self._profile_events
             )
         elif 'vllm' in self.scheduler_config.scheduling_policy:
@@ -1873,6 +1875,14 @@ class SchedulerAdmCtrl(SchedulerInterface):
             if self.scheduler_config.admission_mode == "off":
                 feasible = True
             else:
+                must_admit = (
+                    self.scheduler_config.ablation_no_local or
+                    request.sampling_params.extra_args.get('must_admit', False)
+                )
+                output_length = None
+                if self.scheduler_config.oracle_mem:
+                    output_length = request.sampling_params.extra_args.get(
+                        'output_length', request.max_tokens)
                 feasible = self.atfc_planner.add_request(
                     request_id = request.request_id, 
                     num_prompt_tokens = request.num_prompt_tokens,
@@ -1881,7 +1891,8 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     slo_tpot = self.get_tpot_slo(),
                     prefill_only = request.kv_transfer_params.get('do_remote_decode', False) if request.kv_transfer_params is not None else False,
                     kv_ready_time = request.kv_transfer_params.get('arrival_time', None) if (load_kv_async and request.kv_transfer_params is not None) else None,
-                    must_admit = request.sampling_params.extra_args.get('must_admit', False)
+                    must_admit = must_admit,
+                    output_length = output_length,
                 )
             timer.stop('atfc_planner.add_request')
             if not feasible: 
