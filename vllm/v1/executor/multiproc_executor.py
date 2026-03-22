@@ -597,8 +597,8 @@ class WorkerProc:
 
             worker.worker_busy_loop()
 
-        except Exception as exc:
-            # NOTE: if an Exception arises in busy_loop, we send
+        except BaseException as exc:
+            # NOTE: if startup fails before READY, we send
             # a FAILURE message over the MQ RPC to notify the Executor,
             # which triggers system shutdown.
             # TODO(rob): handle case where the MQ itself breaks.
@@ -624,6 +624,8 @@ class WorkerProc:
             # any worker dies. Set this value so we don't re-throw
             # SystemExit() to avoid zmq exceptions in __del__.
             shutdown_requested = True
+            if not isinstance(exc, Exception):
+                raise
 
         finally:
             if ready_writer is not None:
