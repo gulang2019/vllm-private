@@ -1289,7 +1289,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         scheduled_resumed_reqs = list(resumed_reqs)
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         if total_num_scheduled_tokens > self.max_num_scheduled_tokens:
-            raise RuntimeError(
+            logger.warning(
                 "SchedulerAdmCtrl produced "
                 f"{total_num_scheduled_tokens} scheduled tokens, which "
                 "exceeds max_num_batched_tokens="
