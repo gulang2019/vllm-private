@@ -897,6 +897,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 ddl = self._get_prefill_ddl(req),
                 input_length = input_length + req.num_computed_tokens,
                 n_computed_tokens = req.num_computed_tokens,
+                max_tokens = req.max_tokens,
                 profit = profit,
                 mem = mem,
                 tpot_idx = 0,
@@ -931,8 +932,9 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 ddl = ddl,
                 input_length = max(req.num_prompt_tokens \
                     - req.num_computed_tokens, 0) + req.num_computed_tokens,
-                profit = profit,
                 n_computed_tokens = req.num_computed_tokens,
+                max_tokens = req.max_tokens,
+                profit = profit,
                 mem = 0,
                 tpot_idx = 0,
                 prefill_mem = prefill_mem,
