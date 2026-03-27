@@ -313,11 +313,11 @@ class SchedulerAdmCtrl(SchedulerInterface):
             authentic_perf_model)
         self.perf_model = self._build_control_perf_model(authentic_perf_model)
         self.slosserve_scheduler = SLOsServe_C.AdmCtrlScheduler(self.scheduler_config.scheduling_policy, self.block_size, False, False)
-        self.slosserve_scheduler.set_ar_planner(
-            tpots = [self.get_tpot_slo()],
-            hardware_params = self.perf_model.hardware_params,
-            fixed_bs = False,
-            max_bs = self.scheduler_config.max_num_batched_tokens
+        self.perf_model.configure_cpp_ar_planner(
+            self.slosserve_scheduler,
+            tpots=[self.get_tpot_slo()],
+            fixed_bs=False,
+            max_bs=self.scheduler_config.max_num_batched_tokens,
         )
         logger.info(
             'fetching perf model for model_name: %s and length_pattern: %s, perf model err: %s',
@@ -328,11 +328,11 @@ class SchedulerAdmCtrl(SchedulerInterface):
         logger.info(
             'updating slosserve scheduler with TPOT: %s and control hardware_params: %s',
             self.get_tpot_slo(),
-            self.perf_model.hardware_params,
+            self.perf_model.describe_hardware_params(),
         )
         logger.info(
             'using execution hardware_params: %s',
-            self.execution_perf_model.hardware_params,
+            self.execution_perf_model.describe_hardware_params(),
         )
         if self.scheduler_config.scheduling_policy in ["dp", "edf"]:
             self.stateless_schedule_fn = self._schedule_stateless_slosserve
@@ -510,11 +510,11 @@ class SchedulerAdmCtrl(SchedulerInterface):
             authentic_perf_model)
         self.perf_model = self._build_control_perf_model(authentic_perf_model)
         self.slosserve_scheduler = SLOsServe_C.AdmCtrlScheduler(self.scheduler_config.scheduling_policy, self.block_size, False, False)
-        self.slosserve_scheduler.set_ar_planner(
-            tpots = [self.get_tpot_slo()],
-            hardware_params = self.perf_model.hardware_params,
-            fixed_bs = False,
-            max_bs = self.scheduler_config.max_num_batched_tokens
+        self.perf_model.configure_cpp_ar_planner(
+            self.slosserve_scheduler,
+            tpots=[self.get_tpot_slo()],
+            fixed_bs=False,
+            max_bs=self.scheduler_config.max_num_batched_tokens,
         )
         logger.info(
             'fetching perf model for model_name: %s and length_pattern: %s, perf model err: %s',
@@ -525,11 +525,11 @@ class SchedulerAdmCtrl(SchedulerInterface):
         logger.info(
             'updating slosserve scheduler with TPOT: %s and control hardware_params: %s',
             self.get_tpot_slo(),
-            self.perf_model.hardware_params,
+            self.perf_model.describe_hardware_params(),
         )
         logger.info(
             'using execution hardware_params: %s',
-            self.execution_perf_model.hardware_params,
+            self.execution_perf_model.describe_hardware_params(),
         )
         if self.scheduler_config.scheduling_policy in ["dp", "edf"]:
             self.stateless_schedule_fn = self._schedule_stateless_slosserve
