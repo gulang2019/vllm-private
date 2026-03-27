@@ -47,7 +47,6 @@ from dataclasses import dataclass, field
 
 from SLOsServe.router.execplan_bus import ExecPlan
 from SLOsServe.router.adm_ctrl import BatchPlanner
-from SLOsServe.router.macro import PERF_MODEL_HEADROOM
 
 logger = init_logger(__name__)
         
@@ -379,14 +378,11 @@ class SchedulerAdmCtrl(SchedulerInterface):
     def _build_control_perf_model(self, authentic_perf_model):
         return authentic_perf_model.copy_with_adjustments(
             scale=self.scheduler_config.perf_model_err,
-            constant_offset=self.scheduler_config.scheduling_overhead
-            + PERF_MODEL_HEADROOM,
+            constant_offset=self.scheduler_config.scheduling_overhead,
         )
 
     def _build_execution_perf_model(self, authentic_perf_model):
-        return authentic_perf_model.copy_with_adjustments(
-            constant_offset=self.scheduler_config.scheduling_overhead,
-        )
+        return copy.deepcopy(authentic_perf_model)
             
     def get_load_statistics(self, t: float = 5) -> list[dict[str, Any]]:
         return {
@@ -547,7 +543,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 _max_decode_length = self.scheduler_config.max_decoding_length,
                 _max_batch_size = self.max_num_scheduled_tokens,
                 _is_oracle = self.scheduler_config.oracle_mem,
-                _profile_events = self._profile_events
+                _profile_events = self._profile_events,
             )
         elif 'vllm' in self.scheduler_config.scheduling_policy:
             self.stateless_schedule_fn = self._schedule_stateless_vllm

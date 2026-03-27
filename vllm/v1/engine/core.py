@@ -423,16 +423,11 @@ class EngineCore:
         scheduler_output: SchedulerOutput,
         schedule_timestamp: float,
     ) -> float:
-        exec_plan = engine_state_snapshot.get("exec_plan")
-        if isinstance(exec_plan, dict):
-            batch_times = exec_plan.get("batch_times")
-            if isinstance(batch_times, list) and batch_times:
-                try:
-                    return max(0.0, float(batch_times[0]) - schedule_timestamp)
-                except (TypeError, ValueError):
-                    pass
-
-        perf_model = getattr(self.scheduler, "perf_model", None)
+        perf_model = getattr(self.scheduler, "execution_perf_model", None)
+        if perf_model is None:
+            perf_model = getattr(self.scheduler, "authentic_perf_model", None)
+        if perf_model is None:
+            perf_model = getattr(self.scheduler, "perf_model", None)
         get_batch_time = getattr(perf_model, "get_batch_time", None)
         if not callable(get_batch_time):
             return 0.0
