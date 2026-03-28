@@ -1840,11 +1840,6 @@ class SchedulerAdmCtrl(SchedulerInterface):
         return len(self.running), len(self.waiting_attainable) + len(self.waiting_unattainable)
 
     def add_request(self, request: Request) -> bool:
-        # logger.info(
-        #     f"Adding request: engine_id={self.scheduler_config.engine_id}, "
-        #     f"request_id={request.request_id}, max_tokens={request.max_tokens}, "
-        #     f"prompt_tokens={request.num_prompt_tokens}, sampling_params={request.sampling_params}"
-        # )
         timer = Timer()
         if request.request_id in self.requests:
             # logger.info(f"Received request {request.request_id} that is already in the scheduler, finishing the request sending on local server")
@@ -1869,6 +1864,12 @@ class SchedulerAdmCtrl(SchedulerInterface):
                         request)
         timer.stop('get_computed_blocks')
         request.num_computed_tokens = num_new_local_computed_tokens
+        self._req_cached_tokens[request.request_id] = num_new_local_computed_tokens
+        logger.info(
+            f"Adding request: engine_id={self.scheduler_config.engine_id}, "
+            f"request_id={request.request_id}, max_tokens={request.max_tokens}, "
+            f"prompt_tokens={request.num_prompt_tokens}, sampling_params={request.sampling_params}, cached_tokens={num_new_local_computed_tokens}"
+        )
         
         load_kv_async = False
         num_external_computed_tokens = 0
