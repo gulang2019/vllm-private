@@ -48,6 +48,18 @@ from vllm.v1.metrics.stats import IterationStats
 logger = init_logger(__name__)
 
 
+def _parse_admission_result(
+    result: Any,
+) -> tuple[bool, Optional[str]]:
+    if isinstance(result, dict):
+        admitted = bool(result.get("admitted"))
+        rejection_reason = result.get("rejection_reason")
+        if rejection_reason is not None:
+            rejection_reason = str(rejection_reason)
+        return admitted, rejection_reason
+    return bool(result), None
+
+
 class AsyncLLM(EngineClient):
 
     def __init__(
@@ -329,9 +341,10 @@ class AsyncLLM(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
-    ) -> tuple[bool, Optional[AsyncGenerator[RequestOutput, None]]]:
+    ) -> tuple[bool, Optional[AsyncGenerator[RequestOutput, None]], Optional[str]]:
         """
-        Add a request and return an admission decision plus its output stream.
+        Add a request and return an admission decision, output stream, and
+        optional rejection reason.
 
         This is intended for integrations that need an immediate admitted /
         rejected signal before consuming the stream.
@@ -352,17 +365,18 @@ class AsyncLLM(EngineClient):
             trace_headers, priority, data_parallel_rank)
 
         self.output_processor.add_request(request, prompt_str, None, 0, queue)
-        admitted = await self.engine_core.add_request_with_admission_async(
+        admission_result = await self.engine_core.add_request_with_admission_async(
             request)
+        admitted, rejection_reason = _parse_admission_result(admission_result)
 
         if self.log_requests:
             action = "Added" if admitted else "Rejected"
             logger.info("%s request %s.", action, request.request_id)
 
         if not admitted:
-            return False, None
+            return False, None, rejection_reason
 
-        return True, self._request_output_generator(queue)
+        return True, self._request_output_generator(queue), None
 
     async def _add_request(self, request: EngineCoreRequest,
                            prompt: Optional[str],

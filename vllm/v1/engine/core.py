@@ -568,13 +568,15 @@ class EngineCore:
             self.output_queue.put_nowait((request.client_index, EngineCoreOutputs(outputs=[
                 EngineCoreOutput(request_id=request.request_id, 
                                  new_token_ids=[], 
-                                 finish_reason=request.get_finished_reason())],
+                                 finish_reason=request.get_finished_reason(),
+                                 stop_reason=request.stop_reason)],
                         finished_requests={request.request_id})))
             self._profile_events.append({
                 "event_type": "finish",
                 "request_id": request.request_id,
                 "timestamp": time.time(),
                 "finish_reason": "rejected-arrival",
+                "stop_reason": request.stop_reason,
                 "scheduling_overhead": scheduler_overhead,
             })
             return False
@@ -1365,19 +1367,28 @@ class EngineCoreProc(EngineCore):
         return model_executed
 
     def _publish_add_request_result(self, client_index: int, call_id: int,
-                                    admitted: bool) -> None:
+                                    admitted: bool,
+                                    rejection_reason: str | None = None) -> None:
         if call_id == 0:
             return
 
+        result = {"admitted": admitted}
+        if rejection_reason is not None:
+            result["rejection_reason"] = rejection_reason
         self.output_queue.put_nowait(
             (client_index,
              EngineCoreOutputs(utility_output=UtilityOutput(
-                 call_id, result=UtilityResult(admitted)))))
+                 call_id, result=UtilityResult(result)))))
 
     def _handle_add_request(self, request: Any) -> bool:
         req, request_wave, client_index, call_id = request
         admitted = self.add_request(req, request_wave)
-        self._publish_add_request_result(client_index, call_id, admitted)
+        self._publish_add_request_result(
+            client_index,
+            call_id,
+            admitted,
+            None if admitted else getattr(req, "stop_reason", None),
+        )
         return admitted
 
     def _dispatch_input_request(self, request_type: EngineCoreRequestType,

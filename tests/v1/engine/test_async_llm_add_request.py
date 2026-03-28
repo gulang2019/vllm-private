@@ -124,9 +124,12 @@ async def test_async_llm_add_request_returns_false_when_rejected():
     llm = _make_async_llm()
     request = _make_engine_core_request()
     llm.processor.process_inputs.return_value = ("prompt", request)
-    llm.engine_core.add_request_with_admission_async.return_value = False
+    llm.engine_core.add_request_with_admission_async.return_value = {
+        "admitted": False,
+        "rejection_reason": "CMP",
+    }
 
-    admitted, stream = await llm.add_request(
+    admitted, stream, rejection_reason = await llm.add_request(
         prompt="prompt",
         request_id=request.request_id,
         sampling_params=SamplingParams(max_tokens=1),
@@ -134,6 +137,7 @@ async def test_async_llm_add_request_returns_false_when_rejected():
 
     assert admitted is False
     assert stream is None
+    assert rejection_reason == "CMP"
     llm._run_output_handler.assert_called_once()
     llm.output_processor.add_request.assert_called_once()
     llm.engine_core.add_request_with_admission_async.assert_awaited_once_with(
@@ -145,7 +149,9 @@ async def test_async_llm_add_request_returns_stream_when_admitted():
     llm = _make_async_llm()
     request = _make_engine_core_request()
     llm.processor.process_inputs.return_value = ("prompt", request)
-    llm.engine_core.add_request_with_admission_async.return_value = True
+    llm.engine_core.add_request_with_admission_async.return_value = {
+        "admitted": True,
+    }
 
     captured_queue = None
 
@@ -155,7 +161,7 @@ async def test_async_llm_add_request_returns_stream_when_admitted():
 
     llm.output_processor.add_request.side_effect = capture_queue
 
-    admitted, stream = await llm.add_request(
+    admitted, stream, rejection_reason = await llm.add_request(
         prompt="prompt",
         request_id=request.request_id,
         sampling_params=SamplingParams(max_tokens=1),
@@ -163,6 +169,7 @@ async def test_async_llm_add_request_returns_stream_when_admitted():
 
     assert admitted is True
     assert stream is not None
+    assert rejection_reason is None
     assert captured_queue is not None
 
     captured_queue.put(_make_request_output(request.request_id))

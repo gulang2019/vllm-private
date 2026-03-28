@@ -49,6 +49,23 @@ from SLOsServe.router.execplan_bus import ExecPlan
 from SLOsServe.router.adm_ctrl import BatchPlanner
 
 logger = init_logger(__name__)
+
+
+def _normalize_scheduler_rejection_reason(reason: Any) -> str | None:
+    if reason is None:
+        return None
+    raw = str(reason).strip().upper()
+    if not raw:
+        return None
+    if raw in {"CMP", "COMPUTE"}:
+        return "CMP"
+    if raw in {"MEM", "MEMORY"}:
+        return "MEM"
+    if raw in {"OOM", "REJECTED-OOM", "OUT_OF_MEMORY"}:
+        return "OOM"
+    if raw == "UNKNOWN":
+        return "UNKNOWN"
+    return raw
         
 # class PerfModel:
 #     # _HW_PARAMS = { # model, para_config, hardware -> [k1, k2, b] 
@@ -319,21 +336,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
             fixed_bs=False,
             max_bs=self.scheduler_config.max_num_batched_tokens,
         )
-        logger.info(
-            'fetching perf model for model_name: %s and length_pattern: %s, perf model err: %s',
-            self.scheduler_config.model_name,
-            self.scheduler_config.length_pattern,
-            self.scheduler_config.perf_model_err,
-        )
-        logger.info(
-            'updating slosserve scheduler with TPOT: %s and control hardware_params: %s',
-            self.get_tpot_slo(),
-            self.perf_model.describe_hardware_params(),
-        )
-        logger.info(
-            'using execution hardware_params: %s',
-            self.execution_perf_model.describe_hardware_params(),
-        )
+        self._log_perf_model_configuration()
         if self.scheduler_config.scheduling_policy in ["dp", "edf"]:
             self.stateless_schedule_fn = self._schedule_stateless_slosserve
         elif self.scheduler_config.scheduling_policy == 'atfc':
@@ -373,6 +376,36 @@ class SchedulerAdmCtrl(SchedulerInterface):
         return PerfModel.get_perf_model(
             self.scheduler_config.model_name,
             self.scheduler_config.length_pattern,
+        )
+
+    def _log_perf_model_configuration(self) -> None:
+        authentic_params = self.authentic_perf_model.describe_hardware_params()
+        logger.info(
+            (
+                "Loaded scheduler perf model: model_name=%s length_pattern=%s "
+                "type=%s breakpoints=%s perf_model_err=%s"
+            ),
+            self.scheduler_config.model_name,
+            self.scheduler_config.length_pattern,
+            (
+                "piecewise_current_tokens"
+                if self.authentic_perf_model.is_piecewise_current_tokens
+                else "linear"
+            ),
+            (
+                authentic_params.get("breakpoints")
+                if isinstance(authentic_params, dict) else None
+            ),
+            self.scheduler_config.perf_model_err,
+        )
+        logger.info(
+            'updating slosserve scheduler with TPOT: %s and control hardware_params: %s',
+            self.get_tpot_slo(),
+            self.perf_model.describe_hardware_params(),
+        )
+        logger.info(
+            'using execution hardware_params: %s',
+            self.execution_perf_model.describe_hardware_params(),
         )
 
     def _build_control_perf_model(self, authentic_perf_model):
@@ -516,21 +549,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
             fixed_bs=False,
             max_bs=self.scheduler_config.max_num_batched_tokens,
         )
-        logger.info(
-            'fetching perf model for model_name: %s and length_pattern: %s, perf model err: %s',
-            self.scheduler_config.model_name,
-            self.scheduler_config.length_pattern,
-            self.scheduler_config.perf_model_err,
-        )
-        logger.info(
-            'updating slosserve scheduler with TPOT: %s and control hardware_params: %s',
-            self.get_tpot_slo(),
-            self.perf_model.describe_hardware_params(),
-        )
-        logger.info(
-            'using execution hardware_params: %s',
-            self.execution_perf_model.describe_hardware_params(),
-        )
+        self._log_perf_model_configuration()
         if self.scheduler_config.scheduling_policy in ["dp", "edf"]:
             self.stateless_schedule_fn = self._schedule_stateless_slosserve
         elif self.scheduler_config.scheduling_policy == 'atfc':
@@ -1704,6 +1723,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     request_id=req.request_id,
                     new_token_ids=[],
                     finish_reason=req.get_finished_reason(),
+                    stop_reason=req.stop_reason,
                 )
             )
         self.rejected_reqs.clear()
@@ -1894,6 +1914,11 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 )
             timer.stop('atfc_planner.add_request')
             if not feasible: 
+                request.stop_reason = (
+                    _normalize_scheduler_rejection_reason(
+                        self.atfc_planner.get_last_infeasible_reason())
+                    or "UNKNOWN"
+                )
                 timer.display(thresh = 0.1, label = 'LONGATFC')
                 return False
             
@@ -1911,12 +1936,14 @@ class SchedulerAdmCtrl(SchedulerInterface):
             timer.stop('allocate_slots')
             if new_blocks is None:
                 # TODO(Yi): here is OOM upon arriaval;
+                request.stop_reason = "OOM"
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_REJECTED)
                 self._profile_events.append({
                     "event_type": "finish",
                     "request_id": request.request_id,
                     "timestamp": time.time(),
                     "finish_reason": "rejected-oom",
+                    "stop_reason": request.stop_reason,
                 })
                 if self.scheduler_config.scheduling_policy == 'atfc':
                     self.atfc_planner.finish_request(request.request_id)
@@ -1956,6 +1983,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 if self._exec_plan is not None and \
                     len(self._exec_plan.batch_times) and \
                     ((max(self._exec_plan.batch_times[0], time.time()) + self.perf_model.get_batch_time([(0, request.num_prompt_tokens)])) > self._get_prefill_ddl(request)):
+                    request.stop_reason = "CMP"
                     return False
             if self.policy == SchedulingPolicy.FCFS:
                 self.waiting_attainable.append(request)
