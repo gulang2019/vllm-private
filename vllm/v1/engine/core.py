@@ -576,7 +576,6 @@ class EngineCore:
                 "request_id": request.request_id,
                 "timestamp": time.time(),
                 "finish_reason": "rejected-arrival",
-                "stop_reason": request.stop_reason,
                 "scheduling_overhead": scheduler_overhead,
             })
             return False

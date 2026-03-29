@@ -1954,7 +1954,6 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     "request_id": request.request_id,
                     "timestamp": time.time(),
                     "finish_reason": "rejected-oom",
-                    "stop_reason": request.stop_reason,
                 })
                 if self.scheduler_config.scheduling_policy == 'atfc':
                     self.atfc_planner.finish_request(request.request_id)
