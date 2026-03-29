@@ -192,6 +192,9 @@ class SchedulerConfig:
     
     max_decoding_length: int | None = None 
     """The maximum decoding length."""
+
+    admission_max_decoding_length: int | None = None
+    """The decode-length upper bound used by admission control."""
         
     is_mock_connector: bool = False
     """Whether to use mock connector."""

@@ -341,12 +341,17 @@ class SchedulerAdmCtrl(SchedulerInterface):
             self.stateless_schedule_fn = self._schedule_stateless_slosserve
         elif self.scheduler_config.scheduling_policy == 'atfc':
             self.stateless_schedule_fn = self._schedule_stateless_atfc
+            admission_max_decoding_length = (
+                self.scheduler_config.admission_max_decoding_length
+                if self.scheduler_config.admission_max_decoding_length is not None
+                else self.scheduler_config.max_decoding_length
+            )
             self.atfc_planner = BatchPlanner(
                 _perf_model = copy.deepcopy(self.perf_model),
                 _max_lookahead = 100,
                 _num_free_blocks = self.kv_cache_manager.get_num_free_blocks(),
                 _block_size = self.cache_config.block_size,
-                _max_decode_length = self.scheduler_config.max_decoding_length,
+                _max_decode_length = admission_max_decoding_length,
                 _max_batch_size = self.max_num_scheduled_tokens,
                 _is_oracle = self.scheduler_config.oracle_mem,
             )
@@ -554,12 +559,17 @@ class SchedulerAdmCtrl(SchedulerInterface):
             self.stateless_schedule_fn = self._schedule_stateless_slosserve
         elif self.scheduler_config.scheduling_policy == 'atfc':
             self.stateless_schedule_fn = self._schedule_stateless_atfc
+            admission_max_decoding_length = (
+                self.scheduler_config.admission_max_decoding_length
+                if self.scheduler_config.admission_max_decoding_length is not None
+                else self.scheduler_config.max_decoding_length
+            )
             self.atfc_planner = BatchPlanner(
                 _perf_model = copy.deepcopy(self.perf_model),
                 _max_lookahead = 100,
                 _num_free_blocks = self.kv_cache_manager.get_num_free_blocks(),
                 _block_size = self.cache_config.block_size,
-                _max_decode_length = self.scheduler_config.max_decoding_length,
+                _max_decode_length = admission_max_decoding_length,
                 _max_batch_size = self.max_num_scheduled_tokens,
                 _is_oracle = self.scheduler_config.oracle_mem,
                 _profile_events = self._profile_events,
