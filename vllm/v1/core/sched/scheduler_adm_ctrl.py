@@ -1875,7 +1875,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         timer.stop('get_computed_blocks')
         request.num_computed_tokens = num_new_local_computed_tokens
         self._req_cached_tokens[request.request_id] = num_new_local_computed_tokens
-        logger.info(
+        logger.debug(
             f"Adding request: engine_id={self.scheduler_config.engine_id}, "
             f"request_id={request.request_id}, max_tokens={request.max_tokens}, "
             f"prompt_tokens={request.num_prompt_tokens}, sampling_params={request.sampling_params}, cached_tokens={num_new_local_computed_tokens}"

@@ -417,21 +417,10 @@ class EngineCore:
 
         return float(getattr(request, "arrival_time", time.time()))
 
-    def _get_estimated_batch_time(
+    def _build_perf_model_batch(
         self,
-        engine_state_snapshot: dict[str, Any],
         scheduler_output: SchedulerOutput,
-        schedule_timestamp: float,
-    ) -> float:
-        perf_model = getattr(self.scheduler, "execution_perf_model", None)
-        if perf_model is None:
-            perf_model = getattr(self.scheduler, "authentic_perf_model", None)
-        if perf_model is None:
-            perf_model = getattr(self.scheduler, "perf_model", None)
-        get_batch_time = getattr(perf_model, "get_batch_time", None)
-        if not callable(get_batch_time):
-            return 0.0
-
+    ) -> list[tuple[int, int]]:
         batch: list[tuple[int, int]] = []
         for new_req in scheduler_output.scheduled_new_reqs:
             scheduled_tokens = scheduler_output.num_scheduled_tokens.get(
@@ -447,13 +436,51 @@ class EngineCore:
                 scheduler_output.scheduled_cached_reqs.num_computed_tokens)
             if scheduler_output.num_scheduled_tokens.get(req_id, 0) > 0)
 
-        if not batch:
+        return batch
+
+    def _estimate_batch_time_from_perf_model(
+        self,
+        perf_model: Any,
+        batch: list[tuple[int, int]],
+    ) -> float:
+        get_batch_time = getattr(perf_model, "get_batch_time", None)
+        if not callable(get_batch_time):
             return 0.0
 
         try:
             return float(get_batch_time(batch))
         except Exception:
             return 0.0
+
+    def _get_estimated_batch_time(
+        self,
+        engine_state_snapshot: dict[str, Any],
+        scheduler_output: SchedulerOutput,
+        schedule_timestamp: float,
+    ) -> float:
+        perf_model = getattr(self.scheduler, "execution_perf_model", None)
+        if perf_model is None:
+            perf_model = getattr(self.scheduler, "authentic_perf_model", None)
+        if perf_model is None:
+            perf_model = getattr(self.scheduler, "perf_model", None)
+
+        batch = self._build_perf_model_batch(scheduler_output)
+        if not batch:
+            return 0.0
+        return self._estimate_batch_time_from_perf_model(perf_model, batch)
+
+    def _get_control_estimated_batch_time(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> float | None:
+        perf_model = getattr(self.scheduler, "perf_model", None)
+        if perf_model is None:
+            return None
+
+        batch = self._build_perf_model_batch(scheduler_output)
+        if not batch:
+            return None
+        return self._estimate_batch_time_from_perf_model(perf_model, batch)
 
     def _finalize_pending_batch_event(self, timestamp: float) -> None:
         pending_event = self._pending_batch_event
@@ -575,7 +602,7 @@ class EngineCore:
                 "event_type": "finish",
                 "request_id": request.request_id,
                 "timestamp": time.time(),
-                "finish_reason": "rejected-arrival",
+                "finish_reason": "rejected-oom",
                 "scheduling_overhead": scheduler_overhead,
             })
             return False
@@ -795,6 +822,8 @@ class EngineCore:
         if scheduler_output.total_num_scheduled_tokens > 0:
             estimated_time = self._get_estimated_batch_time(
                 engine_state_snapshot, scheduler_output, schedule_timestamp)
+            control_estimated_time = self._get_control_estimated_batch_time(
+                scheduler_output)
             launch_offset = max(0.0, launch_start - schedule_timestamp)
             finish_offset = max(0.0,
                                 output_processing_start - schedule_timestamp)
@@ -813,6 +842,7 @@ class EngineCore:
                 "scheduling_overhead": scheduling_overhead,
                 "output_processing_elapsed": output_processing_elapsed,
                 "estimated_time": estimated_time,
+                "control_estimated_time": control_estimated_time,
                 "rejected_reqs": [req.request_id for req in rejected_reqs],
                 "publish_overhead": publish_overhead,
                 "extra_args": {
