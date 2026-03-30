@@ -6,7 +6,7 @@ from __future__ import annotations
 import itertools
 import time
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, Optional, Union
 from dataclasses import dataclass
 import math
@@ -1063,7 +1063,19 @@ class SchedulerAdmCtrl(SchedulerInterface):
 
     def _schedule_stateless_atfc(self) -> tuple[tuple[list[Request], list[Request], list[Request], list[Request]], dict[str, int]]:
         preempted_reqs, rejected_reqs, resumed_reqs = [], [], []
-        num_scheduled_tokens, admitted_reqs, self._exec_plan = self.atfc_planner.get_next_batch_and_admitted_reqs()
+        num_scheduled_tokens, admitted_req_ids, self._exec_plan = (
+            self.atfc_planner.get_next_batch_and_admitted_reqs()
+        )
+        admitted_req_ids = set(admitted_req_ids)
+        admitted_reqs = [
+            req for req in self.waiting_attainable
+            if req.request_id in admitted_req_ids
+            or req.request_id in num_scheduled_tokens
+        ]
+        resumed_reqs = [
+            req for req in self.waiting_unattainable
+            if req.request_id in num_scheduled_tokens
+        ]
         # now = time.time()
         # logger.info(
         #     "ATFC device %d running request states: %s",
@@ -1081,7 +1093,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         # every waiting_reqs should be accepted
         # This could be wrong when requests come from kv_ready
         # assert all(req.request_id in admitted_reqs for req in self.waiting_attainable)
-        return (preempted_reqs, copy.copy(self.waiting_attainable), rejected_reqs, resumed_reqs), num_scheduled_tokens
+        return (preempted_reqs, admitted_reqs, rejected_reqs, resumed_reqs), num_scheduled_tokens
 
     def _update_exec_plan(self, batch_schedules) -> None:
         now = time.time()
@@ -1236,8 +1248,10 @@ class SchedulerAdmCtrl(SchedulerInterface):
         new_requests: list[Request] = []
         # for request entering running, we need to allocate the blocks
         failed_requests: list[Request] = []
-        for request_id, num_new_tokens in num_scheduled_tokens.items():
-            request = self.requests[request_id]
+        for request_id, num_new_tokens in list(num_scheduled_tokens.items()):
+            request = self.requests.get(request_id)
+            if request is None:
+                continue
             if request in admitted_reqs or request in resumed_reqs:
                 if request.num_computed_tokens == 0:
                     new_computed_blocks, num_new_local_computed_tokens = \
@@ -1260,37 +1274,76 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     #     f"new_computed_blocks={new_computed_blocks}, "
                     #     f"request.num_computed_tokens={request.num_computed_tokens}"
                     # )
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_new_local_computed_tokens,
-                        new_computed_blocks,
-                        num_lookahead_tokens=0,
-                        delay_cache_blocks=False,
+                    def _allocate_with_prefix_cache() -> Optional[KVCacheBlocks]:
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                            request,
+                            num_new_tokens,
+                            num_new_local_computed_tokens,
+                            new_computed_blocks,
+                            num_lookahead_tokens=0,
+                            delay_cache_blocks=False,
+                        )
+                        self._timer.stop('allocate_slots_1')
+                        return new_blocks
+
+                    new_blocks = self._allocate_slots_with_best_effort_fallback(
+                        request=request,
+                        allocate_once=_allocate_with_prefix_cache,
+                        num_scheduled_tokens=num_scheduled_tokens,
+                        admitted_reqs=admitted_reqs,
+                        resumed_reqs=resumed_reqs,
+                        scheduled_running_reqs=scheduled_running_reqs,
+                        req_to_new_blocks=req_to_new_blocks,
+                        new_requests=new_requests,
                     )
-                    self._timer.stop('allocate_slots_1')
-                    request.num_computed_tokens = num_new_local_computed_tokens
-                    
-                    if request.num_cached_tokens < 0:
-                        request.num_cached_tokens = num_new_local_computed_tokens
-                        self._req_cached_tokens[request.request_id] = num_new_local_computed_tokens
+                    if new_blocks is not None:
+                        request.num_computed_tokens = num_new_local_computed_tokens
+                        if request.num_cached_tokens < 0:
+                            request.num_cached_tokens = num_new_local_computed_tokens
+                            self._req_cached_tokens[request.request_id] = num_new_local_computed_tokens
                         
                 # KV Xfer request after async KV recvs are completed
                 else:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens
+                    def _allocate_existing_request() -> Optional[KVCacheBlocks]:
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                            request,
+                            num_new_tokens
+                        )
+                        self._timer.stop('allocate_slots_2')
+                        return new_blocks
+
+                    new_blocks = self._allocate_slots_with_best_effort_fallback(
+                        request=request,
+                        allocate_once=_allocate_existing_request,
+                        num_scheduled_tokens=num_scheduled_tokens,
+                        admitted_reqs=admitted_reqs,
+                        resumed_reqs=resumed_reqs,
+                        scheduled_running_reqs=scheduled_running_reqs,
+                        req_to_new_blocks=req_to_new_blocks,
+                        new_requests=new_requests,
                     )
-                    self._timer.stop('allocate_slots_2')
             else:
                 if num_new_tokens == 0:
                     new_blocks = self.kv_cache_manager.create_empty_block_list()
                 else:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens
+                    def _allocate_cached_request() -> Optional[KVCacheBlocks]:
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                            request,
+                            num_new_tokens
+                        )
+                        self._timer.stop('allocate_slots_3')
+                        return new_blocks
+
+                    new_blocks = self._allocate_slots_with_best_effort_fallback(
+                        request=request,
+                        allocate_once=_allocate_cached_request,
+                        num_scheduled_tokens=num_scheduled_tokens,
+                        admitted_reqs=admitted_reqs,
+                        resumed_reqs=resumed_reqs,
+                        scheduled_running_reqs=scheduled_running_reqs,
+                        req_to_new_blocks=req_to_new_blocks,
+                        new_requests=new_requests,
                     )
-                    self._timer.stop('allocate_slots_3')
             # assert new_blocks is not None
             if new_blocks is None:
                 # TODO(Yi): here is the OOM during execution; report it back by adding to profile_events
@@ -1849,6 +1902,180 @@ class SchedulerAdmCtrl(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting_attainable) + len(self.waiting_unattainable)
 
+    def _get_request_block_keys(self, request_id: str) -> set[tuple[int, int]]:
+        if request_id not in self.requests:
+            return set()
+        try:
+            block_groups = self.kv_cache_manager.get_block_ids(request_id)
+        except Exception:
+            return set()
+        return {
+            (group_idx, int(block_id))
+            for group_idx, group in enumerate(block_groups)
+            for block_id in group
+        }
+
+    def _get_best_effort_reclaimable_blocks(self) -> int:
+        best_effort_blocks: set[tuple[int, int]] = set()
+        regular_blocks: set[tuple[int, int]] = set()
+        for request in self.requests.values():
+            if request.is_finished():
+                continue
+            block_keys = self._get_request_block_keys(request.request_id)
+            if not block_keys:
+                continue
+            if request.is_best_effort:
+                best_effort_blocks.update(block_keys)
+            else:
+                regular_blocks.update(block_keys)
+        return len(best_effort_blocks - regular_blocks)
+
+    def _get_effective_num_free_blocks_for_admission(self) -> int:
+        return (
+            self.kv_cache_manager.get_num_free_blocks()
+            + self._get_best_effort_reclaimable_blocks()
+        )
+
+    def _pick_best_effort_eviction_victim(
+        self,
+        protected_request_ids: set[str],
+    ) -> Request | None:
+        best_candidate: Request | None = None
+        best_score: tuple[int, int, float, float] | None = None
+        for request in self.requests.values():
+            if request.request_id in protected_request_ids:
+                continue
+            if not request.is_best_effort:
+                continue
+            if request.status not in (RequestStatus.RUNNING, RequestStatus.WAITING):
+                continue
+            block_keys = self._get_request_block_keys(request.request_id)
+            if not block_keys:
+                continue
+            try:
+                freed_blocks = int(
+                    self.kv_cache_manager.get_num_freed_blocks_after_free(request)
+                )
+            except Exception:
+                freed_blocks = 0
+            score = (
+                freed_blocks,
+                len(block_keys),
+                -float(getattr(request, "num_computed_tokens", 0)),
+                float(getattr(request, "arrival_time", 0.0)),
+            )
+            if best_score is None or score > best_score:
+                best_candidate = request
+                best_score = score
+        return best_candidate
+
+    def _prune_requests_from_schedule_state(
+        self,
+        request_ids: set[str],
+        *,
+        num_scheduled_tokens: dict[str, int],
+        admitted_reqs: list[Request],
+        resumed_reqs: list[Request],
+        scheduled_running_reqs: list[Request],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+        new_requests: list[Request],
+    ) -> None:
+        for request_id in request_ids:
+            num_scheduled_tokens.pop(request_id, None)
+            req_to_new_blocks.pop(request_id, None)
+        admitted_reqs[:] = [
+            req for req in admitted_reqs
+            if req.request_id not in request_ids
+        ]
+        resumed_reqs[:] = [
+            req for req in resumed_reqs
+            if req.request_id not in request_ids
+        ]
+        scheduled_running_reqs[:] = [
+            req for req in scheduled_running_reqs
+            if req.request_id not in request_ids
+        ]
+        new_requests[:] = [
+            req for req in new_requests
+            if req.request_id not in request_ids
+        ]
+
+    def _drop_best_effort_request(
+        self,
+        request: Request,
+        *,
+        protected_request_id: str,
+        num_scheduled_tokens: dict[str, int],
+        admitted_reqs: list[Request],
+        resumed_reqs: list[Request],
+        scheduled_running_reqs: list[Request],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+        new_requests: list[Request],
+    ) -> str | None:
+        request_id = request.request_id
+        if request_id not in self.requests or not request.is_best_effort:
+            return None
+        request.stop_reason = "BEST_EFFORT_PREEMPTED"
+        self._profile_events.append({
+            "event_type": "best_effort_evicted",
+            "request_id": request_id,
+            "timestamp": time.time(),
+            "extra_args": {
+                "reason": "make_room_for_regular_request",
+                "protected_request_id": protected_request_id,
+            },
+        })
+        self.reject_requests(request_id)
+        if self.scheduler_config.scheduling_policy == 'atfc':
+            self.atfc_planner.finish_request(request_id)
+        self._prune_requests_from_schedule_state(
+            {request_id},
+            num_scheduled_tokens=num_scheduled_tokens,
+            admitted_reqs=admitted_reqs,
+            resumed_reqs=resumed_reqs,
+            scheduled_running_reqs=scheduled_running_reqs,
+            req_to_new_blocks=req_to_new_blocks,
+            new_requests=new_requests,
+        )
+        return request_id
+
+    def _allocate_slots_with_best_effort_fallback(
+        self,
+        *,
+        request: Request,
+        allocate_once: Callable[[], Optional[KVCacheBlocks]],
+        num_scheduled_tokens: dict[str, int],
+        admitted_reqs: list[Request],
+        resumed_reqs: list[Request],
+        scheduled_running_reqs: list[Request],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+        new_requests: list[Request],
+    ) -> Optional[KVCacheBlocks]:
+        new_blocks = allocate_once()
+        if new_blocks is not None or request.is_best_effort:
+            return new_blocks
+
+        protected_request_ids = {request.request_id}
+        while new_blocks is None:
+            victim = self._pick_best_effort_eviction_victim(protected_request_ids)
+            if victim is None:
+                break
+            dropped_request_id = self._drop_best_effort_request(
+                victim,
+                protected_request_id=request.request_id,
+                num_scheduled_tokens=num_scheduled_tokens,
+                admitted_reqs=admitted_reqs,
+                resumed_reqs=resumed_reqs,
+                scheduled_running_reqs=scheduled_running_reqs,
+                req_to_new_blocks=req_to_new_blocks,
+                new_requests=new_requests,
+            )
+            if dropped_request_id is None:
+                break
+            protected_request_ids.add(dropped_request_id)
+            new_blocks = allocate_once()
+        return new_blocks
+
     def add_request(self, request: Request) -> bool:
         timer = Timer()
         if request.request_id in self.requests:
@@ -1912,6 +2139,11 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 if self.scheduler_config.oracle_mem:
                     output_length = request.sampling_params.extra_args.get(
                         'output_length', request.max_tokens)
+                num_free_blocks_override = (
+                    self._get_effective_num_free_blocks_for_admission()
+                    if not request.is_best_effort
+                    else self.kv_cache_manager.get_num_free_blocks()
+                )
                 feasible = self.atfc_planner.add_request(
                     request_id = request.request_id, 
                     num_prompt_tokens = request.num_prompt_tokens,
@@ -1921,7 +2153,9 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     prefill_only = request.kv_transfer_params.get('do_remote_decode', False) if request.kv_transfer_params is not None else False,
                     kv_ready_time = request.kv_transfer_params.get('arrival_time', None) if (load_kv_async and request.kv_transfer_params is not None) else None,
                     must_admit = must_admit,
+                    service_tier = request.service_tier,
                     output_length = output_length,
+                    num_free_blocks_override = num_free_blocks_override,
                 )
             timer.stop('atfc_planner.add_request')
             if not feasible: 
@@ -1936,7 +2170,8 @@ class SchedulerAdmCtrl(SchedulerInterface):
         # if load_kv_async: # we only allocate for requests that are waiting for remote kv
         if load_kv_async:
             assert num_external_computed_tokens > 0
-            new_blocks = self.kv_cache_manager.allocate_slots(
+            def _allocate_remote_kv_slots() -> Optional[KVCacheBlocks]:
+                new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_external_computed_tokens,
                     num_new_local_computed_tokens,
@@ -1944,7 +2179,19 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     num_lookahead_tokens=0,
                     delay_cache_blocks=True,
                 )
-            timer.stop('allocate_slots')
+                timer.stop('allocate_slots')
+                return new_blocks
+
+            new_blocks = self._allocate_slots_with_best_effort_fallback(
+                request=request,
+                allocate_once=_allocate_remote_kv_slots,
+                num_scheduled_tokens={},
+                admitted_reqs=[],
+                resumed_reqs=[],
+                scheduled_running_reqs=[],
+                req_to_new_blocks={},
+                new_requests=[],
+            )
             if new_blocks is None:
                 # TODO(Yi): here is OOM upon arriaval;
                 request.stop_reason = "OOM"

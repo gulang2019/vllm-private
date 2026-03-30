@@ -216,6 +216,21 @@ class Request:
     @property
     def router_arrival_time(self) -> float:
         return self.sampling_params.extra_args['router_arrival_time']
+
+    @property
+    def service_tier(self) -> str:
+        extra_args = getattr(self.sampling_params, "extra_args", None)
+        if isinstance(extra_args, dict):
+            tier = extra_args.get("service_tier")
+            if tier is None:
+                tier = extra_args.get("initial_service_tier")
+            if tier is not None:
+                return str(tier)
+        return "default"
+
+    @property
+    def is_best_effort(self) -> bool:
+        return self.service_tier == "best_effort"
     # @property
     # def prefill_ddl(self) -> float:
     #     # return self.sampling_params.extra_args.get('prefill_ddl', 
