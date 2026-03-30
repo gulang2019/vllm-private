@@ -246,8 +246,13 @@ class EngineCore:
     def _normalize_load_stats(load_stats: Any | None) -> dict[str, int]:
         normalized = {
             "num_free_blocks": 0,
+            "effective_num_free_blocks": 0,
             "n_waitings": 0,
             "n_running": 0,
+            "n_regular_waitings": 0,
+            "n_regular_running": 0,
+            "n_best_effort_waitings": 0,
+            "n_best_effort_running": 0,
         }
         if not isinstance(load_stats, dict):
             return normalized
@@ -260,8 +265,36 @@ class EngineCore:
                 normalized[key] = default_value
         return normalized
 
+    @staticmethod
+    def _get_optional_scheduler_method(scheduler: Any,
+                                       method_name: str) -> Any | None:
+        mock_children = getattr(scheduler, "_mock_children", None)
+        if isinstance(mock_children, dict) and method_name in mock_children:
+            method = mock_children[method_name]
+            return method if callable(method) else None
+
+        scheduler_dict = getattr(scheduler, "__dict__", None)
+        if isinstance(scheduler_dict, dict) and method_name in scheduler_dict:
+            method = scheduler_dict[method_name]
+            return method if callable(method) else None
+
+        class_method = getattr(type(scheduler), method_name, None)
+        if class_method is None:
+            return None
+
+        method = getattr(scheduler, method_name, None)
+        return method if callable(method) else None
+
     def _get_scheduler_exec_plan_snapshot(self) -> Optional[dict[str, Any]]:
-        getter = getattr(self.scheduler, "get_exec_plan", None)
+        getter = self._get_optional_scheduler_method(
+            self.scheduler,
+            "get_router_exec_plan",
+        )
+        if getter is None:
+            getter = self._get_optional_scheduler_method(
+                self.scheduler,
+                "get_exec_plan",
+            )
         if not callable(getter):
             return None
 

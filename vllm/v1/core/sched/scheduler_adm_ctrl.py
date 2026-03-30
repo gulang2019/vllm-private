@@ -422,11 +422,38 @@ class SchedulerAdmCtrl(SchedulerInterface):
     def _build_execution_perf_model(self, authentic_perf_model):
         return copy.deepcopy(authentic_perf_model)
             
-    def get_load_statistics(self, t: float = 5) -> list[dict[str, Any]]:
+    def _count_requests_by_tier(
+        self,
+        requests: Iterable[Request],
+    ) -> tuple[int, int]:
+        regular = 0
+        best_effort = 0
+        for request in requests:
+            if request.is_finished():
+                continue
+            if request.is_best_effort:
+                best_effort += 1
+            else:
+                regular += 1
+        return regular, best_effort
+
+    def get_load_statistics(self, t: float = 5) -> dict[str, Any]:
+        regular_waiting, best_effort_waiting = self._count_requests_by_tier(
+            itertools.chain(self.waiting_attainable, self.waiting_kv_xfer),
+        )
+        regular_running, best_effort_running = self._count_requests_by_tier(
+            self.running,
+        )
         return {
             'num_free_blocks': self.kv_cache_manager.get_num_free_blocks(),
+            'effective_num_free_blocks':
+            self._get_effective_num_free_blocks_for_admission(),
             'n_waitings': len(self.waiting_attainable) + len(self.waiting_kv_xfer),
-            'n_running': len(self.running)
+            'n_running': len(self.running),
+            'n_regular_waitings': regular_waiting,
+            'n_regular_running': regular_running,
+            'n_best_effort_waitings': best_effort_waiting,
+            'n_best_effort_running': best_effort_running,
         }
 
     def reset(self, profile_events: dict | None = None):
@@ -1111,6 +1138,66 @@ class SchedulerAdmCtrl(SchedulerInterface):
 
     def get_exec_plan(self):
         return self._exec_plan
+
+    def get_router_exec_plan(self):
+        if self._exec_plan is None:
+            return None
+
+        router_plan = ExecPlan()
+        router_plan.num_free_blocks = (
+            self._get_effective_num_free_blocks_for_admission())
+        router_plan.batch_id = getattr(self._exec_plan, "batch_id", None)
+
+        req_plans = getattr(self._exec_plan, "req_plans", None)
+        batch_times = getattr(self._exec_plan, "batch_times", None)
+        if not isinstance(req_plans, dict) or not isinstance(batch_times, list):
+            return router_plan
+
+        active_regular_req_ids = {
+            request_id for request_id, request in self.requests.items()
+            if (not request.is_finished()) and (not request.is_best_effort)
+        }
+        active_batch_ids: set[int] = set()
+        filtered_req_plans: dict[str, list[tuple[int, int]]] = {}
+
+        for req_id in active_regular_req_ids:
+            req_plan = req_plans.get(req_id)
+            if not isinstance(req_plan, list):
+                continue
+            filtered_steps: list[tuple[int, int]] = []
+            for step in req_plan:
+                if not isinstance(step, (list, tuple)) or len(step) != 2:
+                    continue
+                try:
+                    n_tokens = int(step[0])
+                    batch_id = int(step[1])
+                except (TypeError, ValueError):
+                    continue
+                if not (0 <= batch_id < len(batch_times)):
+                    continue
+                active_batch_ids.add(batch_id)
+                filtered_steps.append((n_tokens, batch_id))
+            if filtered_steps:
+                filtered_req_plans[req_id] = filtered_steps
+
+        if not active_batch_ids:
+            return router_plan
+
+        batch_id_map = {
+            old_batch_id: new_batch_id
+            for new_batch_id, old_batch_id in enumerate(sorted(active_batch_ids))
+        }
+        router_plan.batch_times = [
+            float(batch_times[old_batch_id])
+            for old_batch_id in sorted(active_batch_ids)
+        ]
+        for req_id, req_plan in filtered_req_plans.items():
+            router_plan.req_plans[req_id] = [
+                (n_tokens, batch_id_map[batch_id])
+                for n_tokens, batch_id in req_plan
+                if batch_id in batch_id_map
+            ]
+        return router_plan
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
