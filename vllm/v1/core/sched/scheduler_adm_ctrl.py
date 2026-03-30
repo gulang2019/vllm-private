@@ -354,6 +354,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 _max_decode_length = admission_max_decoding_length,
                 _max_batch_size = self.max_num_scheduled_tokens,
                 _is_oracle = self.scheduler_config.oracle_mem,
+                _fast_sched_baseline_bsz = self.scheduler_config.fast_sched_baseline_bsz,
             )
         elif 'vllm' in self.scheduler_config.scheduling_policy:
             self.stateless_schedule_fn = self._schedule_stateless_vllm
@@ -599,6 +600,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 _max_decode_length = admission_max_decoding_length,
                 _max_batch_size = self.max_num_scheduled_tokens,
                 _is_oracle = self.scheduler_config.oracle_mem,
+                _fast_sched_baseline_bsz = self.scheduler_config.fast_sched_baseline_bsz,
                 _profile_events = self._profile_events,
             )
         elif 'vllm' in self.scheduler_config.scheduling_policy:

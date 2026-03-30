@@ -232,6 +232,9 @@ class SchedulerConfig:
     oracle_mem: bool = False
     """Whether the scheduler assumes knowledge on the decode length"""
 
+    fast_sched_baseline_bsz: int | None = None
+    """Synthetic batch size used to derive the fast-scheduler baseline cutoff."""
+
     ablation_no_local: bool = False
     """Whether ATFC should force local admission regardless of feasibility."""
     
