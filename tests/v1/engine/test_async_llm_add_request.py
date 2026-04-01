@@ -273,8 +273,13 @@ async def test_async_llm_output_handler_publishes_engine_state_snapshot():
     assert args[2].num_free_blocks == 7
     assert kwargs["load_stats"] == {
         "num_free_blocks": 6,
+        "effective_num_free_blocks": 0,
         "n_waitings": 2,
         "n_running": 1,
+        "n_regular_waitings": 0,
+        "n_regular_running": 0,
+        "n_best_effort_waitings": 0,
+        "n_best_effort_running": 0,
     }
     llm.output_processor.process_outputs.assert_called_once_with(
         [], outputs.timestamp, None)

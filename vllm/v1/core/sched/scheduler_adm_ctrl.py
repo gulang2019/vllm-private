@@ -14,6 +14,7 @@ import asyncio
 import json
 import bisect
 import copy
+import os
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
@@ -353,8 +354,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 _block_size = self.cache_config.block_size,
                 _max_decode_length = admission_max_decoding_length,
                 _max_batch_size = self.max_num_scheduled_tokens,
-                _is_oracle = self.scheduler_config.oracle_mem,
-                _fast_sched_baseline_bsz = self.scheduler_config.fast_sched_baseline_bsz,
+                _is_oracle = self.scheduler_config.oracle_mem
             )
         elif 'vllm' in self.scheduler_config.scheduling_policy:
             self.stateless_schedule_fn = self._schedule_stateless_vllm
@@ -448,7 +448,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         return {
             'num_free_blocks': self.kv_cache_manager.get_num_free_blocks(),
             'effective_num_free_blocks':
-            self._get_effective_num_free_blocks_for_admission(),
+            self._get_snapshot_num_free_blocks(),
             'n_waitings': len(self.waiting_attainable) + len(self.waiting_kv_xfer),
             'n_running': len(self.running),
             'n_regular_waitings': regular_waiting,
@@ -459,6 +459,24 @@ class SchedulerAdmCtrl(SchedulerInterface):
 
     def reset(self, profile_events: dict | None = None):
         logger.info('SchedulerAdmCtrl::reset')
+        snapshot_use_effective = os.getenv(
+            "SLOSSERVE_SNAPSHOT_USE_EFFECTIVE_FREE_BLOCKS", "0"
+        ).strip().lower()
+        self._snapshot_use_effective_free_blocks = snapshot_use_effective in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        assume_no_overlap = os.getenv(
+            "SLOSSERVE_ASSUME_NO_BE_BLOCK_OVERLAP", "1"
+        ).strip().lower()
+        self._assume_no_be_block_overlap = assume_no_overlap in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
         # by update_from_outputs(). This is currently used in the multi-engine
@@ -600,7 +618,6 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 _max_decode_length = admission_max_decoding_length,
                 _max_batch_size = self.max_num_scheduled_tokens,
                 _is_oracle = self.scheduler_config.oracle_mem,
-                _fast_sched_baseline_bsz = self.scheduler_config.fast_sched_baseline_bsz,
                 _profile_events = self._profile_events,
             )
         elif 'vllm' in self.scheduler_config.scheduling_policy:
@@ -1147,7 +1164,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
 
         router_plan = ExecPlan()
         router_plan.num_free_blocks = (
-            self._get_effective_num_free_blocks_for_admission())
+            self._get_snapshot_num_free_blocks())
         router_plan.batch_id = getattr(self._exec_plan, "batch_id", None)
 
         req_plans = getattr(self._exec_plan, "req_plans", None)
@@ -2019,11 +2036,34 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 regular_blocks.update(block_keys)
         return len(best_effort_blocks - regular_blocks)
 
+    def _get_best_effort_reclaimable_blocks_no_overlap(self) -> int:
+        reclaimable = 0
+        for request in self.requests.values():
+            if request.is_finished() or (not request.is_best_effort):
+                continue
+            try:
+                block_groups = self.kv_cache_manager.get_block_ids(
+                    request.request_id)
+            except Exception:
+                continue
+            reclaimable += sum(len(group) for group in block_groups)
+        return reclaimable
+
     def _get_effective_num_free_blocks_for_admission(self) -> int:
+        reclaimable_blocks = (
+            self._get_best_effort_reclaimable_blocks_no_overlap()
+            if getattr(self, "_assume_no_be_block_overlap", True) else
+            self._get_best_effort_reclaimable_blocks()
+        )
         return (
             self.kv_cache_manager.get_num_free_blocks()
-            + self._get_best_effort_reclaimable_blocks()
+            + reclaimable_blocks
         )
+
+    def _get_snapshot_num_free_blocks(self) -> int:
+        if getattr(self, "_snapshot_use_effective_free_blocks", False):
+            return self._get_effective_num_free_blocks_for_admission()
+        return self.kv_cache_manager.get_num_free_blocks()
 
     def _pick_best_effort_eviction_victim(
         self,

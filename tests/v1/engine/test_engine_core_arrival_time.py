@@ -230,7 +230,7 @@ def test_add_request_ack_is_sent_for_immediate_add():
     assert outputs.utility_output is not None
     assert outputs.utility_output.call_id == 11
     assert outputs.utility_output.result is not None
-    assert outputs.utility_output.result.result is False
+    assert outputs.utility_output.result.result == {"admitted": False}
 
 
 def test_get_load_statistics_uses_safe_scheduler_defaults():
@@ -244,15 +244,25 @@ def test_get_load_statistics_uses_safe_scheduler_defaults():
 
     assert core.get_load_statistics() == {
         "num_free_blocks": 11,
+        "effective_num_free_blocks": 0,
         "n_waitings": 3,
         "n_running": 1,
+        "n_regular_waitings": 0,
+        "n_regular_running": 0,
+        "n_best_effort_waitings": 0,
+        "n_best_effort_running": 0,
     }
     assert core._make_engine_state_snapshot() == {
         "exec_plan": None,
         "load_stats": {
             "num_free_blocks": 11,
+            "effective_num_free_blocks": 0,
             "n_waitings": 3,
             "n_running": 1,
+            "n_regular_waitings": 0,
+            "n_regular_running": 0,
+            "n_best_effort_waitings": 0,
+            "n_best_effort_running": 0,
         },
     }
 
@@ -296,8 +306,9 @@ def test_finalize_pending_batch_event_uses_next_schedule_interval():
     assert "_schedule_timestamp" not in event
 
 
-def test_get_estimated_batch_time_uses_exec_plan_first_batch_time():
+def test_get_estimated_batch_time_returns_zero_without_perf_model():
     core = _make_core_proc()
+    core.scheduler = SimpleNamespace(execution_perf_model=None)
     scheduler_output = _make_scheduler_output()
 
     estimated_time = core._get_estimated_batch_time(
@@ -310,7 +321,7 @@ def test_get_estimated_batch_time_uses_exec_plan_first_batch_time():
         schedule_timestamp=10.5,
     )
 
-    assert estimated_time == 1.25
+    assert estimated_time == 0.0
 
 
 def test_get_estimated_batch_time_falls_back_to_perf_model():
@@ -485,8 +496,13 @@ def test_step_publishes_engine_state_snapshot_before_model_execution():
         },
         "load_stats": {
             "num_free_blocks": 9,
+            "effective_num_free_blocks": 0,
             "n_waitings": 2,
             "n_running": 1,
+            "n_regular_waitings": 0,
+            "n_regular_running": 0,
+            "n_best_effort_waitings": 0,
+            "n_best_effort_running": 0,
         },
     }
 
@@ -533,7 +549,12 @@ def test_step_with_batch_queue_publishes_engine_state_snapshot_on_schedule():
         },
         "load_stats": {
             "num_free_blocks": 6,
+            "effective_num_free_blocks": 0,
             "n_waitings": 1,
             "n_running": 2,
+            "n_regular_waitings": 0,
+            "n_regular_running": 0,
+            "n_best_effort_waitings": 0,
+            "n_best_effort_running": 0,
         },
     }
