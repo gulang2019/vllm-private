@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import itertools
+import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Iterable
 from typing import Any, Optional, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import asyncio
 import json
@@ -25,6 +26,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (KVConnectorBase_V1,
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1, KVConnectorMetadata, KVConnectorOutput
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.platforms import current_platform
+from vllm.utils import cuda_device_count_stateless, import_pynvml
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
                                                 compute_encoder_budget)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
@@ -44,7 +47,6 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 
 import SLOsServe_C
-from dataclasses import dataclass, field
 
 from SLOsServe.router.execplan_bus import ExecPlan
 from SLOsServe.router.adm_ctrl import BatchPlanner
@@ -67,6 +69,237 @@ def _normalize_scheduler_rejection_reason(reason: Any) -> str | None:
     if raw == "UNKNOWN":
         return "UNKNOWN"
     return raw
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid float for %s=%r; using %s", name, raw, default)
+        return default
+
+
+def _env_int_list(name: str) -> tuple[int, ...] | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return ()
+    try:
+        return tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    except ValueError:
+        logger.warning("Invalid integer list for %s=%r; ignoring override", name,
+                       raw)
+        return None
+
+
+@dataclass
+class GpuClockMonitorConfig:
+    enabled: bool = False
+    poll_interval_s: float = 0.05
+    window_s: float = 0.25
+    slack_s: float = 0.006
+    low_clock_threshold_mhz: float | None = None
+    low_clock_ratio: float = 0.995
+    device_ids: tuple[int, ...] | None = None
+    use_zero_load_prefill_gate: bool = True
+    log_state_changes: bool = True
+
+
+@dataclass
+class GpuClockMonitorState:
+    enabled: bool = False
+    throttled: bool = False
+    slack_s: float = 0.0
+    threshold_mhz: float | None = None
+    nominal_mhz: float | None = None
+    effective_avg_mhz: float | None = None
+    average_power_w: float | None = None
+    updated_at: float = 0.0
+    monitored_device_ids: tuple[int, ...] = field(default_factory=tuple)
+    physical_device_ids: tuple[int, ...] = field(default_factory=tuple)
+
+
+class GpuClockMonitor:
+
+    def __init__(
+        self,
+        config: GpuClockMonitorConfig,
+        on_state_change: Callable[[GpuClockMonitorState], None],
+    ) -> None:
+        self.config = config
+        self._on_state_change = on_state_change
+        self._state = GpuClockMonitorState(enabled=config.enabled)
+        self._state_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not self.config.enabled or self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="slosserve-gpu-clock-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(self.config.poll_interval_s * 4.0, 0.2))
+            self._thread = None
+
+    def get_state(self) -> GpuClockMonitorState:
+        with self._state_lock:
+            return copy.deepcopy(self._state)
+
+    def _set_state(self, state: GpuClockMonitorState) -> None:
+        with self._state_lock:
+            previous = self._state
+            self._state = copy.deepcopy(state)
+        changed = (
+            previous.updated_at == 0.0
+            or previous.throttled != state.throttled
+            or abs(previous.slack_s - state.slack_s) > 1e-12
+            or previous.threshold_mhz != state.threshold_mhz
+        )
+        if changed:
+            self._on_state_change(copy.deepcopy(state))
+
+    def _resolve_device_ids(self) -> tuple[int, ...]:
+        if self.config.device_ids is not None:
+            return self.config.device_ids
+        try:
+            visible_count = cuda_device_count_stateless()
+        except Exception as exc:
+            logger.warning("Failed to resolve visible CUDA devices for clock "
+                           "monitor: %r", exc)
+            return ()
+        return tuple(range(int(visible_count)))
+
+    def _resolve_nominal_mhz(self, pynvml: Any, handles: list[Any]) -> float | None:
+        if self.config.low_clock_threshold_mhz is not None:
+            return self.config.low_clock_threshold_mhz
+        maxima: list[float] = []
+        for handle in handles:
+            try:
+                maxima.append(
+                    float(
+                        pynvml.nvmlDeviceGetMaxClockInfo(
+                            handle,
+                            pynvml.NVML_CLOCK_SM,
+                        )))
+            except Exception:
+                continue
+        if not maxima:
+            return None
+        return min(maxima)
+
+    def _run(self) -> None:
+        try:
+            pynvml = import_pynvml()
+            pynvml.nvmlInit()
+        except Exception as exc:
+            logger.warning("Failed to initialize NVML clock monitor: %r", exc)
+            return
+
+        try:
+            device_ids = self._resolve_device_ids()
+            if not device_ids:
+                logger.warning("Clock monitor enabled but no CUDA devices are "
+                               "visible to the scheduler process")
+                return
+
+            physical_device_ids = tuple(
+                current_platform.device_id_to_physical_device_id(device_id)
+                for device_id in device_ids
+            )
+            handles = [
+                pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+                for physical_device_id in physical_device_ids
+            ]
+            samples: dict[int, deque[tuple[float, float, float | None]]] = {
+                device_id: deque() for device_id in device_ids
+            }
+            nominal_mhz = self._resolve_nominal_mhz(pynvml, handles)
+            threshold_mhz = self.config.low_clock_threshold_mhz
+            if threshold_mhz is None and nominal_mhz is not None:
+                threshold_mhz = nominal_mhz * self.config.low_clock_ratio
+
+            while not self._stop_event.is_set():
+                now = time.time()
+                avg_mhzs: list[float] = []
+                avg_powers: list[float] = []
+
+                for device_id, handle in zip(device_ids, handles):
+                    sm_mhz = float(
+                        pynvml.nvmlDeviceGetClockInfo(
+                            handle,
+                            pynvml.NVML_CLOCK_SM,
+                        ))
+                    power_w: float | None = None
+                    try:
+                        power_w = float(pynvml.nvmlDeviceGetPowerUsage(handle)) / 1000.0
+                    except Exception:
+                        power_w = None
+
+                    history = samples[device_id]
+                    history.append((now, sm_mhz, power_w))
+                    cutoff = now - self.config.window_s
+                    while history and history[0][0] < cutoff:
+                        history.popleft()
+
+                    avg_mhzs.append(sum(sample[1] for sample in history) /
+                                    max(len(history), 1))
+                    power_samples = [
+                        sample[2] for sample in history if sample[2] is not None
+                    ]
+                    if power_samples:
+                        avg_powers.append(
+                            sum(power_samples) / max(len(power_samples), 1))
+
+                effective_avg_mhz = min(avg_mhzs) if avg_mhzs else None
+                average_power_w = (
+                    sum(avg_powers) / len(avg_powers) if avg_powers else None
+                )
+                throttled = (
+                    effective_avg_mhz is not None
+                    and threshold_mhz is not None
+                    and effective_avg_mhz < threshold_mhz
+                )
+                state = GpuClockMonitorState(
+                    enabled=True,
+                    throttled=throttled,
+                    slack_s=self.config.slack_s if throttled else 0.0,
+                    threshold_mhz=threshold_mhz,
+                    nominal_mhz=nominal_mhz,
+                    effective_avg_mhz=effective_avg_mhz,
+                    average_power_w=average_power_w,
+                    updated_at=now,
+                    monitored_device_ids=device_ids,
+                    physical_device_ids=physical_device_ids,
+                )
+                self._set_state(state)
+                self._stop_event.wait(self.config.poll_interval_s)
+        except Exception as exc:
+            logger.warning("GPU clock monitor stopped after NVML error: %r", exc)
+        finally:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
         
 # class PerfModel:
 #     # _HW_PARAMS = { # model, para_config, hardware -> [k1, k2, b] 
@@ -220,6 +453,10 @@ class SchedulerAdmCtrl(SchedulerInterface):
         self.structured_output_manager = structured_output_manager
         self.mm_registry = mm_registry
         self.include_finished_set = include_finished_set
+        self._clock_monitor_config = self._load_clock_monitor_config()
+        self._clock_monitor_state = GpuClockMonitorState(
+            enabled=self._clock_monitor_config.enabled)
+        self._clock_monitor: GpuClockMonitor | None = None
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
         # by update_from_outputs(). This is currently used in the multi-engine
@@ -375,6 +612,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         print('kv cache manager initialized', self.kv_cache_manager)
         self._timer = Timer()
         self._exec_plan = None
+        self._maybe_start_clock_monitor()
 
     def _load_authentic_perf_model(self):
         from SLOsServe.perf_model import PerfModel
@@ -382,6 +620,176 @@ class SchedulerAdmCtrl(SchedulerInterface):
         return PerfModel.get_perf_model(
             self.scheduler_config.model_name,
             self.scheduler_config.length_pattern,
+        )
+
+    def _scheduler_config_override(self, field_name: str) -> Any:
+        if not hasattr(self.scheduler_config, field_name):
+            return None
+        return getattr(self.scheduler_config, field_name)
+
+    def _load_clock_monitor_config(self) -> GpuClockMonitorConfig:
+        enabled = self._scheduler_config_override("clock_monitor_enabled")
+        if enabled is None:
+            enabled = _env_flag("SLOSSERVE_VLLM_CLOCK_MONITOR", False)
+
+        poll_interval_s = self._scheduler_config_override(
+            "clock_monitor_interval_s")
+        if poll_interval_s is None:
+            poll_interval_s = _env_float(
+                "SLOSSERVE_VLLM_CLOCK_MONITOR_INTERVAL_S", 0.05)
+
+        window_s = self._scheduler_config_override("clock_monitor_window_s")
+        if window_s is None:
+            window_s = _env_float(
+                "SLOSSERVE_VLLM_CLOCK_MONITOR_WINDOW_S", 0.25)
+
+        slack_s = self._scheduler_config_override("clock_monitor_slack_s")
+        if slack_s is None:
+            slack_s = _env_float(
+                "SLOSSERVE_VLLM_CLOCK_MONITOR_SLACK_MS", 6.0) / 1000.0
+
+        low_clock_threshold_mhz = self._scheduler_config_override(
+            "clock_monitor_low_mhz")
+        if low_clock_threshold_mhz is None:
+            low_clock_threshold_mhz = _env_float(
+                "SLOSSERVE_VLLM_CLOCK_MONITOR_LOW_MHZ",
+                -1.0,
+            )
+
+        low_clock_ratio = self._scheduler_config_override(
+            "clock_monitor_low_mhz_ratio")
+        if low_clock_ratio is None:
+            low_clock_ratio = _env_float(
+                "SLOSSERVE_VLLM_CLOCK_MONITOR_LOW_MHZ_RATIO",
+                0.995,
+            )
+
+        device_ids = self._scheduler_config_override("clock_monitor_device_ids")
+        if device_ids is None:
+            device_ids = _env_int_list("SLOSSERVE_VLLM_CLOCK_MONITOR_DEVICE_IDS")
+        elif isinstance(device_ids, tuple):
+            device_ids = tuple(int(device_id) for device_id in device_ids)
+        else:
+            device_ids = tuple(int(device_id) for device_id in device_ids)
+
+        use_prefill_estimate = self._scheduler_config_override(
+            "clock_monitor_use_prefill_estimate")
+        if use_prefill_estimate is None:
+            use_prefill_estimate = _env_flag(
+                "SLOSSERVE_VLLM_CLOCK_MONITOR_USE_PREFILL_ESTIMATE",
+                True,
+            )
+
+        log_state_changes = self._scheduler_config_override(
+            "clock_monitor_log_state_changes")
+        if log_state_changes is None:
+            log_state_changes = _env_flag(
+                "SLOSSERVE_VLLM_CLOCK_MONITOR_LOG_STATE_CHANGES",
+                True,
+            )
+
+        return GpuClockMonitorConfig(
+            enabled=bool(enabled),
+            poll_interval_s=max(float(poll_interval_s), 0.01),
+            window_s=max(float(window_s), 0.05),
+            slack_s=max(float(slack_s), 0.0),
+            low_clock_threshold_mhz=(
+                float(low_clock_threshold_mhz)
+                if low_clock_threshold_mhz is not None
+                and float(low_clock_threshold_mhz) > 0.0 else None
+            ),
+            low_clock_ratio=min(
+                max(
+                    float(low_clock_ratio),
+                    0.0,
+                ),
+                1.0,
+            ),
+            device_ids=device_ids,
+            use_zero_load_prefill_gate=bool(use_prefill_estimate),
+            log_state_changes=bool(log_state_changes),
+        )
+
+    def _is_vllm_scheduling_policy(self) -> bool:
+        return "vllm" in self.scheduler_config.scheduling_policy
+
+    def _clock_monitor_supported(self) -> bool:
+        return (
+            self._clock_monitor_config.enabled
+            and self._is_vllm_scheduling_policy()
+            and self.vllm_config.is_simulation not in ("logical", "emulate")
+            and current_platform.is_cuda_alike()
+        )
+
+    def _apply_clock_monitor_slack(self, slack_s: float) -> None:
+        for model_attr in ("perf_model", "execution_perf_model"):
+            model = getattr(self, model_attr, None)
+            if model is not None:
+                model._online_spike_slack = slack_s
+
+    def _on_clock_monitor_state_change(self, state: GpuClockMonitorState) -> None:
+        self._clock_monitor_state = state
+        self._apply_clock_monitor_slack(state.slack_s)
+        if self._clock_monitor_config.log_state_changes:
+            logger.info(
+                "vLLM clock monitor: throttled=%s slack_ms=%.3f avg_mhz=%s "
+                "threshold_mhz=%s avg_power_w=%s visible_devices=%s "
+                "physical_devices=%s",
+                state.throttled,
+                state.slack_s * 1000.0,
+                (
+                    round(state.effective_avg_mhz, 2)
+                    if state.effective_avg_mhz is not None else None
+                ),
+                (
+                    round(state.threshold_mhz, 2)
+                    if state.threshold_mhz is not None else None
+                ),
+                (
+                    round(state.average_power_w, 2)
+                    if state.average_power_w is not None else None
+                ),
+                state.monitored_device_ids,
+                state.physical_device_ids,
+            )
+
+    def _stop_clock_monitor(self) -> None:
+        if self._clock_monitor is None:
+            self._clock_monitor_state = GpuClockMonitorState(
+                enabled=self._clock_monitor_config.enabled)
+            self._apply_clock_monitor_slack(0.0)
+            return
+        self._clock_monitor.stop()
+        self._clock_monitor = None
+        self._clock_monitor_state = GpuClockMonitorState(
+            enabled=self._clock_monitor_config.enabled)
+        self._apply_clock_monitor_slack(0.0)
+
+    def _maybe_start_clock_monitor(self) -> None:
+        if not self._clock_monitor_supported():
+            self._stop_clock_monitor()
+            return
+        if self._clock_monitor is None:
+            logger.info(
+                "Enabling vLLM clock monitor: poll_interval_s=%.3f "
+                "window_s=%.3f slack_ms=%.3f device_ids=%s",
+                self._clock_monitor_config.poll_interval_s,
+                self._clock_monitor_config.window_s,
+                self._clock_monitor_config.slack_s * 1000.0,
+                self._clock_monitor_config.device_ids,
+            )
+            self._clock_monitor = GpuClockMonitor(
+                self._clock_monitor_config,
+                self._on_clock_monitor_state_change,
+            )
+            self._clock_monitor.start()
+        else:
+            self._apply_clock_monitor_slack(self._clock_monitor_state.slack_s)
+
+    def _should_use_clock_monitor_prefill_gate(self) -> bool:
+        return (
+            self._clock_monitor_supported()
+            and self._clock_monitor_config.use_zero_load_prefill_gate
         )
 
     def _log_perf_model_configuration(self) -> None:
@@ -459,6 +867,10 @@ class SchedulerAdmCtrl(SchedulerInterface):
 
     def reset(self, profile_events: dict | None = None):
         logger.info('SchedulerAdmCtrl::reset')
+        self._stop_clock_monitor()
+        self._clock_monitor_config = self._load_clock_monitor_config()
+        self._clock_monitor_state = GpuClockMonitorState(
+            enabled=self._clock_monitor_config.enabled)
         snapshot_use_effective = os.getenv(
             "SLOSSERVE_SNAPSHOT_USE_EFFECTIVE_FREE_BLOCKS", "0"
         ).strip().lower()
@@ -637,6 +1049,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         self._req_cached_tokens: dict[str, int] = {}
         
         logger.info(f'SchedulerAdmCtrl::reset {self.scheduler_config}, max_num_batched_tokens: {self.max_num_scheduled_tokens}')
+        self._maybe_start_clock_monitor()
     
     def get_tpot_slo(self):
         return self.scheduler_config.slo_tpot
@@ -656,9 +1069,16 @@ class SchedulerAdmCtrl(SchedulerInterface):
         '''
         remain_prefill_tokens = max(request.num_prompt_tokens - request.num_computed_tokens, 0)
         if remain_prefill_tokens == 0: return True
-        # estimated_prefill_time = self.perf_model.get_batch_time([(request.num_computed_tokens, remain_prefill_tokens)])
-        
-        return self.timer.current_time() < self._get_prefill_ddl(request)
+        now = self.timer.current_time()
+        ddl = self._get_prefill_ddl(request)
+        if now >= ddl:
+            return False
+        if not self._should_use_clock_monitor_prefill_gate():
+            return True
+        estimated_prefill_time = self.perf_model.get_batch_time([
+            (request.num_computed_tokens, remain_prefill_tokens)
+        ])
+        return (now + estimated_prefill_time) < ddl
 
     def _schedule_stateless_vllm(self) -> tuple[tuple[list[Request], list[Request], list[Request], list[Request]], dict[str, int]]:
         '''
@@ -2563,6 +2983,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
+        self._stop_clock_monitor()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
 

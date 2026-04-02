@@ -237,6 +237,33 @@ class SchedulerConfig:
 
     ablation_no_local: bool = False
     """Whether ATFC should force local admission regardless of feasibility."""
+
+    clock_monitor_enabled: bool | None = None
+    """Override the vLLM clock-throttling monitor toggle when set."""
+
+    clock_monitor_interval_s: float | None = None
+    """Polling interval for the scheduler-side GPU clock monitor."""
+
+    clock_monitor_window_s: float | None = None
+    """Rolling averaging window for the scheduler-side GPU clock monitor."""
+
+    clock_monitor_slack_s: float | None = None
+    """Additive slack applied while the clock monitor considers the GPU throttled."""
+
+    clock_monitor_low_mhz: float | None = None
+    """Absolute low-clock threshold in MHz. When unset, derive from max clock."""
+
+    clock_monitor_low_mhz_ratio: float | None = None
+    """Ratio of nominal SM clock used to derive the low-clock threshold."""
+
+    clock_monitor_device_ids: list[int] | None = None
+    """Visible device ids monitored for throttling state."""
+
+    clock_monitor_use_prefill_estimate: bool | None = None
+    """Whether the attainability gate should use the throttling-aware prefill estimate."""
+
+    clock_monitor_log_state_changes: bool | None = None
+    """Whether to log state changes from the scheduler-side clock monitor."""
     
     def compute_hash(self) -> str:
         """
