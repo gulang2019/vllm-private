@@ -860,6 +860,28 @@ class EngineCore:
             launch_offset = max(0.0, launch_start - schedule_timestamp)
             finish_offset = max(0.0,
                                 output_processing_start - schedule_timestamp)
+            load_stats = engine_state_snapshot.get("load_stats", {})
+            if not isinstance(load_stats, dict):
+                load_stats = {}
+            total_blocks = int(
+                getattr(self.vllm_config.cache_config, "num_gpu_blocks", 0) or 0
+            )
+            block_size = int(
+                getattr(self.vllm_config.cache_config, "block_size", 0) or 0
+            )
+            num_free_blocks = int(load_stats.get("num_free_blocks", 0) or 0)
+            effective_num_free_blocks = int(
+                load_stats.get("effective_num_free_blocks", num_free_blocks)
+                or num_free_blocks
+            )
+            used_blocks = max(0, total_blocks - num_free_blocks)
+            effective_used_blocks = max(0, total_blocks - effective_num_free_blocks)
+            total_kv_memory_bytes = int(
+                getattr(self, "available_gpu_memory_for_kv_cache", 0) or 0
+            )
+            bytes_per_block = int(
+                total_kv_memory_bytes / total_blocks
+            ) if total_blocks > 0 and total_kv_memory_bytes > 0 else 0
 
             self._pending_batch_event = {
                 "event_type": "batch",
@@ -878,6 +900,31 @@ class EngineCore:
                 "control_estimated_time": control_estimated_time,
                 "rejected_reqs": [req.request_id for req in rejected_reqs],
                 "publish_overhead": publish_overhead,
+                "total_blocks": total_blocks,
+                "num_free_blocks": num_free_blocks,
+                "effective_num_free_blocks": effective_num_free_blocks,
+                "used_blocks": used_blocks,
+                "effective_used_blocks": effective_used_blocks,
+                "block_size": block_size,
+                "bytes_per_block": bytes_per_block,
+                "total_kv_tokens": total_blocks * block_size,
+                "free_kv_tokens": num_free_blocks * block_size,
+                "effective_free_kv_tokens": (
+                    effective_num_free_blocks * block_size
+                ),
+                "used_kv_tokens": used_blocks * block_size,
+                "effective_used_kv_tokens": (
+                    effective_used_blocks * block_size
+                ),
+                "total_kv_memory_bytes": total_kv_memory_bytes,
+                "free_kv_memory_bytes": num_free_blocks * bytes_per_block,
+                "effective_free_kv_memory_bytes": (
+                    effective_num_free_blocks * bytes_per_block
+                ),
+                "used_kv_memory_bytes": used_blocks * bytes_per_block,
+                "effective_used_kv_memory_bytes": (
+                    effective_used_blocks * bytes_per_block
+                ),
                 "extra_args": {
                     "to_schedule": 0.0,
                     "to_launch": launch_offset,
