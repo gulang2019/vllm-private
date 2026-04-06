@@ -53,6 +53,8 @@ from SLOsServe.router.adm_ctrl import BatchPlanner
 
 logger = init_logger(__name__)
 
+POST_ADMISSION_OOM_STOP_REASON = "POST_ADMISSION_OOM"
+
 
 def _normalize_scheduler_rejection_reason(reason: Any) -> str | None:
     if reason is None:
@@ -608,6 +610,11 @@ class SchedulerAdmCtrl(SchedulerInterface):
         
         self.rejected_reqs: list[Request] = []
         self._req_cached_tokens: dict[str, int] = {}
+        self._load_stat_counters: dict[str, int] = {
+            "n_oom_rejects": 0,
+            "n_arrival_oom_rejects": 0,
+            "n_post_admission_oom_rejects": 0,
+        }
         self._profile_events: list[dict] = []
         print('kv cache manager initialized', self.kv_cache_manager)
         self._timer = Timer()
@@ -853,7 +860,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         regular_running, best_effort_running = self._count_requests_by_tier(
             self.running,
         )
-        return {
+        stats = {
             'num_free_blocks': self.kv_cache_manager.get_num_free_blocks(),
             'effective_num_free_blocks':
             self._get_snapshot_num_free_blocks(),
@@ -864,6 +871,8 @@ class SchedulerAdmCtrl(SchedulerInterface):
             'n_best_effort_waitings': best_effort_waiting,
             'n_best_effort_running': best_effort_running,
         }
+        stats.update(self._load_stat_counters)
+        return stats
 
     def reset(self, profile_events: dict | None = None):
         logger.info('SchedulerAdmCtrl::reset')
@@ -1047,6 +1056,11 @@ class SchedulerAdmCtrl(SchedulerInterface):
         
         self.rejected_reqs: list[Request] = []
         self._req_cached_tokens: dict[str, int] = {}
+        self._load_stat_counters = {
+            "n_oom_rejects": 0,
+            "n_arrival_oom_rejects": 0,
+            "n_post_admission_oom_rejects": 0,
+        }
         
         logger.info(f'SchedulerAdmCtrl::reset {self.scheduler_config}, max_num_batched_tokens: {self.max_num_scheduled_tokens}')
         self._maybe_start_clock_monitor()
@@ -1872,8 +1886,27 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     )
             # assert new_blocks is not None
             if new_blocks is None:
-                # TODO(Yi): here is the OOM during execution; report it back by adding to profile_events
-                logger.error(f"Request {request.request_id} cannot be scheduled")
+                request.stop_reason = POST_ADMISSION_OOM_STOP_REASON
+                self._load_stat_counters["n_oom_rejects"] += 1
+                self._load_stat_counters["n_post_admission_oom_rejects"] += 1
+                logger.error(
+                    "Request %s hit post-admission OOM and will be returned "
+                    "to the router for rejection/rescheduling",
+                    request.request_id,
+                )
+                self.reject_requests(request.request_id)
+                if self.scheduler_config.scheduling_policy == 'atfc':
+                    self.atfc_planner.finish_request(request.request_id)
+                self._profile_events.append({
+                    "event_type": "finish",
+                    "request_id": request.request_id,
+                    "timestamp": time.time(),
+                    "finish_reason": "reject-post-admission-oom",
+                    "extra_args": {
+                        "num_computed_tokens": request.num_computed_tokens,
+                        "num_output_tokens": request.num_output_tokens,
+                    },
+                })
                 failed_requests.append(request)
                 continue
             
@@ -2313,6 +2346,8 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     new_token_ids=[],
                     finish_reason=req.get_finished_reason(),
                     stop_reason=req.stop_reason,
+                    num_cached_tokens=req.num_cached_tokens,
+                    num_computed_tokens=req.num_computed_tokens,
                 )
             )
         self.rejected_reqs.clear()
@@ -2744,6 +2779,8 @@ class SchedulerAdmCtrl(SchedulerInterface):
             if new_blocks is None:
                 # TODO(Yi): here is OOM upon arriaval;
                 request.stop_reason = "OOM"
+                self._load_stat_counters["n_oom_rejects"] += 1
+                self._load_stat_counters["n_arrival_oom_rejects"] += 1
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_REJECTED)
                 self._profile_events.append({
                     "event_type": "finish",

@@ -253,6 +253,9 @@ class EngineCore:
             "n_regular_running": 0,
             "n_best_effort_waitings": 0,
             "n_best_effort_running": 0,
+            "n_oom_rejects": 0,
+            "n_arrival_oom_rejects": 0,
+            "n_post_admission_oom_rejects": 0,
         }
         if not isinstance(load_stats, dict):
             return normalized
@@ -629,7 +632,9 @@ class EngineCore:
                 EngineCoreOutput(request_id=request.request_id, 
                                  new_token_ids=[], 
                                  finish_reason=request.get_finished_reason(),
-                                 stop_reason=request.stop_reason)],
+                                 stop_reason=request.stop_reason,
+                                 num_cached_tokens=request.num_cached_tokens,
+                                 num_computed_tokens=request.num_computed_tokens)],
                         finished_requests={request.request_id})))
             self._profile_events.append({
                 "event_type": "finish",

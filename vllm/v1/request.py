@@ -135,7 +135,7 @@ class Request:
         else:
             mm_kwargs_lst = None
 
-        return cls(
+        req = cls(
             request_id=request.request_id,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
@@ -154,6 +154,9 @@ class Request:
             priority=request.priority,
             block_hasher=block_hasher,
         )
+        if request.existing_output_token_ids:
+            req.append_output_token_ids(list(request.existing_output_token_ids))
+        return req
 
     def append_output_token_ids(
         self,

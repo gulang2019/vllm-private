@@ -73,6 +73,7 @@ class EngineCoreRequest(
     # a wave finished notification is received.
     current_wave: int = 0
     priority: int = 0
+    existing_output_token_ids: Optional[list[int]] = None
 
 
 class EngineCoreEventType(enum.IntEnum):

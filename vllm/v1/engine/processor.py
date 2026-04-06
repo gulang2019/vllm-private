@@ -291,6 +291,18 @@ class Processor:
         else:
             pooling_params = params.clone()
 
+        existing_output_token_ids: Optional[list[int]] = None
+        if sampling_params is not None:
+            extra_args = getattr(sampling_params, "extra_args", None)
+            if isinstance(extra_args, dict):
+                raw_existing_output_token_ids = extra_args.get(
+                    "existing_output_token_ids")
+                if raw_existing_output_token_ids:
+                    existing_output_token_ids = [
+                        int(token_id)
+                        for token_id in raw_existing_output_token_ids
+                    ]
+
         # Multimodal related.
         sorted_mm_inputs: Optional[list[Optional[MultiModalKwargsItem]]] = None
         sorted_mm_positions: Optional[list[PlaceholderRange]] = None
@@ -337,6 +349,7 @@ class Processor:
             cache_salt=decoder_inputs.get("cache_salt"),
             priority=priority,
             data_parallel_rank=data_parallel_rank,
+            existing_output_token_ids=existing_output_token_ids,
         )
 
     def _validate_model_inputs(self,
