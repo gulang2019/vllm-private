@@ -183,6 +183,9 @@ class SchedulerConfig:
     
     scheduling_overhead: float = 0.0
     """The scheduling overhead."""
+
+    scheduling_safety_margin: float = 0.0
+    """Additional target margin so control estimate stays above elapsed time."""
     
     engine_id: int = -1
     """The engine id."""

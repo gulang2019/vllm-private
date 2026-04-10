@@ -277,7 +277,7 @@ class AsyncLLM(EngineClient):
     @staticmethod
     def _materialize_engine_state_snapshot(
         engine_state_snapshot: Any | None
-    ) -> tuple[Any | None, dict[str, int]]:
+    ) -> tuple[Any | None, dict[str, int | float]]:
         from SLOsServe.router.execplan_bus import (normalize_exec_plan,
                                                    normalize_load_stats)
 

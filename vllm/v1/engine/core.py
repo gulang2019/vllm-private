@@ -243,30 +243,10 @@ class EngineCore:
             self._allow_immediate_add_requests.clear()
 
     @staticmethod
-    def _normalize_load_stats(load_stats: Any | None) -> dict[str, int]:
-        normalized = {
-            "num_free_blocks": 0,
-            "effective_num_free_blocks": 0,
-            "n_waitings": 0,
-            "n_running": 0,
-            "n_regular_waitings": 0,
-            "n_regular_running": 0,
-            "n_best_effort_waitings": 0,
-            "n_best_effort_running": 0,
-            "n_oom_rejects": 0,
-            "n_arrival_oom_rejects": 0,
-            "n_post_admission_oom_rejects": 0,
-        }
-        if not isinstance(load_stats, dict):
-            return normalized
+    def _normalize_load_stats(load_stats: Any | None) -> dict[str, int | float]:
+        from SLOsServe.router.execplan_bus import normalize_load_stats
 
-        for key, default_value in normalized.items():
-            value = load_stats.get(key, default_value)
-            try:
-                normalized[key] = int(value)
-            except (TypeError, ValueError):
-                normalized[key] = default_value
-        return normalized
+        return normalize_load_stats(load_stats)
 
     @staticmethod
     def _get_optional_scheduler_method(scheduler: Any,
@@ -313,6 +293,7 @@ class EngineCore:
             "req_plans": {},
             "batch_times": [],
             "num_free_blocks": None,
+            "batch_id": None,
         }
 
         req_plans = getattr(exec_plan, "req_plans", None)
@@ -346,10 +327,17 @@ class EngineCore:
             except (TypeError, ValueError):
                 snapshot["num_free_blocks"] = None
 
+        batch_id = getattr(exec_plan, "batch_id", None)
+        if batch_id is not None:
+            try:
+                snapshot["batch_id"] = int(batch_id)
+            except (TypeError, ValueError):
+                snapshot["batch_id"] = None
+
         return snapshot
 
     def _get_scheduler_load_stats_snapshot(
-            self, t: float = 1) -> dict[str, int]:
+            self, t: float = 1) -> dict[str, int | float]:
         getter = getattr(self.scheduler, "get_load_statistics", None)
         if callable(getter):
             try:
@@ -396,10 +384,20 @@ class EngineCore:
                 except Exception:
                     num_free_blocks = 0
 
+        control_online_slack_ms = 0.0
+        perf_model = getattr(self.scheduler, "perf_model", None)
+        if perf_model is not None:
+            try:
+                control_online_slack_ms = 1000.0 * float(
+                    getattr(perf_model, "_online_spike_slack", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                control_online_slack_ms = 0.0
+
         return self._normalize_load_stats({
             "num_free_blocks": num_free_blocks,
             "n_waitings": waiting,
             "n_running": running,
+            "control_online_slack_ms": control_online_slack_ms,
         })
 
     def _make_engine_state_snapshot(self) -> dict[str, Any]:
@@ -792,6 +790,13 @@ class EngineCore:
             # Check for any requests remaining in the scheduler - unfinished,
             # or finished and not yet removed from the batch.
             if not self.scheduler.has_requests():
+                clear_control_timing_anchor = getattr(
+                    self.scheduler,
+                    "clear_control_timing_anchor",
+                    None,
+                )
+                if callable(clear_control_timing_anchor):
+                    clear_control_timing_anchor()
                 return {}, False
             self._prepare_scheduler_batch_context()
             scheduler_output = self.scheduler.schedule()

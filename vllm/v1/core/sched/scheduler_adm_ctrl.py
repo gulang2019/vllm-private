@@ -48,6 +48,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 import SLOsServe_C
 
+from SLOsServe.perf_model import summarize_perf_model
 from SLOsServe.router.execplan_bus import ExecPlan
 from SLOsServe.router.adm_ctrl import BatchPlanner
 
@@ -459,6 +460,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         self._clock_monitor_state = GpuClockMonitorState(
             enabled=self._clock_monitor_config.enabled)
         self._clock_monitor: GpuClockMonitor | None = None
+        self._clock_monitor_applied_slack_s = 0.0
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
         # by update_from_outputs(). This is currently used in the multi-engine
@@ -619,6 +621,13 @@ class SchedulerAdmCtrl(SchedulerInterface):
         print('kv cache manager initialized', self.kv_cache_manager)
         self._timer = Timer()
         self._exec_plan = None
+        self._reset_control_timing_metrics()
+        self._long_sched_warn_threshold_s = _env_float(
+            "SLOSSERVE_VLLM_LONG_SCHED_WARN_THRESHOLD_S", 0.1)
+        self._long_sched_detail_threshold_s = _env_float(
+            "SLOSSERVE_VLLM_LONG_SCHED_DETAIL_THRESHOLD_S", 0.01)
+        self._long_sched_top_k = int(
+            _env_float("SLOSSERVE_VLLM_LONG_SCHED_TOP_K", 8))
         self._maybe_start_clock_monitor()
 
     def _load_authentic_perf_model(self):
@@ -628,6 +637,83 @@ class SchedulerAdmCtrl(SchedulerInterface):
             self.scheduler_config.model_name,
             self.scheduler_config.length_pattern,
         )
+
+    def _long_sched_value(self, value: Any) -> Any:
+        if isinstance(value, Request):
+            return {
+                "request_id": value.request_id,
+                "status": value.status.name,
+                "scheduled": bool(value.scheduled),
+                "priority": value.priority,
+                "is_best_effort": bool(getattr(value, "is_best_effort", False)),
+                "service_tier": getattr(value, "service_tier", None),
+                "num_prompt_tokens": int(getattr(value, "num_prompt_tokens", 0)),
+                "num_tokens": int(getattr(value, "num_tokens", 0)),
+                "num_output_tokens": int(getattr(value, "num_output_tokens", 0)),
+                "num_computed_tokens": int(getattr(value, "num_computed_tokens", 0)),
+                "num_cached_tokens": int(getattr(value, "num_cached_tokens", 0)),
+            }
+        if isinstance(value, RequestStatus):
+            return value.name
+        if isinstance(value, dict):
+            return {
+                str(k): self._long_sched_value(v)
+                for k, v in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._long_sched_value(v) for v in value]
+        if isinstance(value, float):
+            return round(value, 6)
+        return value
+
+    def _record_long_sched_span(
+        self,
+        spans: list[dict[str, Any]],
+        name: str,
+        started_at: float,
+        **extra: Any,
+    ) -> float:
+        elapsed_s = time.time() - started_at
+        if elapsed_s < self._long_sched_detail_threshold_s:
+            return elapsed_s
+        item: dict[str, Any] = {
+            "name": name,
+            "elapsed_s": round(elapsed_s, 6),
+        }
+        for key, value in extra.items():
+            item[key] = self._long_sched_value(value)
+        spans.append(item)
+        return elapsed_s
+
+    def _log_long_schedule_details(
+        self,
+        *,
+        spans: list[dict[str, Any]],
+        total_num_scheduled_tokens: int,
+        num_scheduled_tokens: dict[str, int],
+    ) -> None:
+        if not spans:
+            return
+        payload = {
+            "top_spans": sorted(
+                spans,
+                key=lambda item: float(item["elapsed_s"]),
+                reverse=True,
+            )[:self._long_sched_top_k],
+            "running": len(self.running),
+            "waiting_attainable": len(self.waiting_attainable),
+            "waiting_unattainable": len(self.waiting_unattainable),
+            "waiting_kv_xfer": len(self.waiting_kv_xfer),
+            "total_num_scheduled_tokens": int(total_num_scheduled_tokens),
+            "num_scheduled_reqs": len(num_scheduled_tokens),
+            "max_num_new_tokens": (
+                max(int(v) for v in num_scheduled_tokens.values())
+                if num_scheduled_tokens else 0
+            ),
+            "num_free_blocks": int(self.kv_cache_manager.get_num_free_blocks()),
+        }
+        logger.warning("LONG SCHEDULING DETAILS: %s",
+                       json.dumps(payload, sort_keys=True))
 
     def _scheduler_config_override(self, field_name: str) -> Any:
         if not hasattr(self.scheduler_config, field_name):
@@ -729,10 +815,31 @@ class SchedulerAdmCtrl(SchedulerInterface):
         )
 
     def _apply_clock_monitor_slack(self, slack_s: float) -> None:
+        previous_slack_s = float(
+            getattr(self, "_clock_monitor_applied_slack_s", 0.0) or 0.0
+        )
+        next_slack_s = max(float(slack_s), 0.0)
         for model_attr in ("perf_model", "execution_perf_model"):
             model = getattr(self, model_attr, None)
             if model is not None:
-                model._online_spike_slack = slack_s
+                base_slack_s = float(
+                    getattr(model, "_online_spike_slack", 0.0) or 0.0
+                )
+                model._online_spike_slack = max(
+                    base_slack_s - previous_slack_s + next_slack_s,
+                    0.0,
+                )
+        atfc_planner = getattr(self, "atfc_planner", None)
+        atfc_perf_model = getattr(atfc_planner, "_perf_model", None)
+        if atfc_perf_model is not None:
+            base_slack_s = float(
+                getattr(atfc_perf_model, "_online_spike_slack", 0.0) or 0.0
+            )
+            atfc_perf_model._online_spike_slack = max(
+                base_slack_s - previous_slack_s + next_slack_s,
+                0.0,
+            )
+        self._clock_monitor_applied_slack_s = next_slack_s
 
     def _on_clock_monitor_state_change(self, state: GpuClockMonitorState) -> None:
         self._clock_monitor_state = state
@@ -800,7 +907,9 @@ class SchedulerAdmCtrl(SchedulerInterface):
         )
 
     def _log_perf_model_configuration(self) -> None:
-        authentic_params = self.authentic_perf_model.describe_hardware_params()
+        authentic_summary = summarize_perf_model(self.authentic_perf_model)
+        control_summary = summarize_perf_model(self.perf_model)
+        execution_summary = summarize_perf_model(self.execution_perf_model)
         logger.info(
             (
                 "Loaded scheduler perf model: model_name=%s length_pattern=%s "
@@ -808,25 +917,29 @@ class SchedulerAdmCtrl(SchedulerInterface):
             ),
             self.scheduler_config.model_name,
             self.scheduler_config.length_pattern,
-            (
-                "piecewise_current_tokens"
-                if self.authentic_perf_model.is_piecewise_current_tokens
-                else "linear"
-            ),
-            (
-                authentic_params.get("breakpoints")
-                if isinstance(authentic_params, dict) else None
-            ),
+            authentic_summary.get("type"),
+            authentic_summary.get("breakpoints"),
             self.scheduler_config.perf_model_err,
         )
         logger.info(
-            'updating slosserve scheduler with TPOT: %s and control hardware_params: %s',
+            (
+                "Scheduler perf models initialized: tpot=%s "
+                "scheduling_overhead_s=%s scheduling_safety_margin_s=%s "
+                "clock_monitor_applied_slack_s=%s "
+                "authentic=%s control=%s execution=%s"
+            ),
             self.get_tpot_slo(),
-            self.perf_model.describe_hardware_params(),
-        )
-        logger.info(
-            'using execution hardware_params: %s',
-            self.execution_perf_model.describe_hardware_params(),
+            float(
+                getattr(self.scheduler_config, "scheduling_overhead", 0.0) or 0.0
+            ),
+            float(
+                getattr(self.scheduler_config, "scheduling_safety_margin", 0.0)
+                or 0.0
+            ),
+            float(getattr(self, "_clock_monitor_applied_slack_s", 0.0) or 0.0),
+            authentic_summary,
+            control_summary,
+            execution_summary,
         )
 
     def _build_control_perf_model(self, authentic_perf_model):
@@ -837,6 +950,147 @@ class SchedulerAdmCtrl(SchedulerInterface):
 
     def _build_execution_perf_model(self, authentic_perf_model):
         return copy.deepcopy(authentic_perf_model)
+
+    def _get_cpp_online_slack(self) -> float:
+        atfc_planner = getattr(self, "atfc_planner", None)
+        atfc_perf_model = getattr(atfc_planner, "_perf_model", None)
+        if atfc_perf_model is not None:
+            try:
+                return float(
+                    getattr(atfc_perf_model, "_online_spike_slack", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                pass
+        perf_model = getattr(self, "perf_model", None)
+        return float(getattr(perf_model, "_online_spike_slack", 0.0) or 0.0)
+
+    def _reset_control_timing_metrics(self) -> None:
+        self._control_time_last_schedule_point_s: float | None = None
+        self._control_time_last_estimated_s: float | None = None
+        self._control_time_last_delta_s: float | None = None
+        self._control_time_elapsed_avg_s: float | None = None
+        self._control_time_estimated_avg_s: float | None = None
+        self._control_time_delta_avg_s: float | None = None
+        self._control_time_delta_samples = 0
+
+    def clear_control_timing_anchor(self) -> None:
+        self._control_time_last_schedule_point_s = None
+        self._control_time_last_estimated_s = None
+
+    def _build_control_perf_batch(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> list[tuple[int, int]]:
+        batch: list[tuple[int, int]] = []
+        for req_data in scheduler_output.scheduled_new_reqs:
+            scheduled_tokens = scheduler_output.num_scheduled_tokens.get(
+                req_data.req_id,
+                0,
+            )
+            if scheduled_tokens > 0:
+                batch.append((req_data.num_computed_tokens, scheduled_tokens))
+
+        batch.extend(
+            (num_computed_tokens,
+             scheduler_output.num_scheduled_tokens.get(req_id, 0))
+            for req_id, num_computed_tokens in zip(
+                scheduler_output.scheduled_cached_reqs.req_ids,
+                scheduler_output.scheduled_cached_reqs.num_computed_tokens,
+            )
+            if scheduler_output.num_scheduled_tokens.get(req_id, 0) > 0
+        )
+        return batch
+
+    def _estimate_control_scheduled_batch_time(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> float | None:
+        perf_model = getattr(self, "perf_model", None)
+        if perf_model is None:
+            return None
+
+        batch = self._build_control_perf_batch(scheduler_output)
+        if not batch:
+            return None
+
+        get_batch_time = getattr(perf_model, "get_batch_time", None)
+        if not callable(get_batch_time):
+            return None
+
+        try:
+            return float(get_batch_time(batch))
+        except Exception:
+            return None
+
+    def _observe_control_timing_delta(self, schedule_point_s: float) -> None:
+        previous_schedule_point_s = self._control_time_last_schedule_point_s
+        previous_estimated_s = self._control_time_last_estimated_s
+        if previous_schedule_point_s is None or previous_estimated_s is None:
+            return
+
+        elapsed_s = max(
+            0.0,
+            float(schedule_point_s) - float(previous_schedule_point_s),
+        )
+        estimated_s = max(0.0, float(previous_estimated_s))
+        delta_s = elapsed_s - estimated_s
+        safety_margin_s = max(
+            0.0,
+            float(
+                getattr(
+                    self.scheduler_config,
+                    "scheduling_safety_margin",
+                    0.0,
+                ) or 0.0
+            ),
+        )
+        delta_for_update_s = delta_s + safety_margin_s
+
+        perf_model = getattr(self, "perf_model", None)
+        try:
+            decay = float(getattr(perf_model, "_decay_factor", 0.99))
+        except (TypeError, ValueError):
+            decay = 0.99
+        decay = min(max(decay, 0.0), 1.0)
+        if self._control_time_delta_samples == 0:
+            self._control_time_elapsed_avg_s = elapsed_s
+            self._control_time_estimated_avg_s = estimated_s
+            self._control_time_delta_avg_s = delta_s
+        else:
+            self._control_time_elapsed_avg_s = (
+                decay * float(self._control_time_elapsed_avg_s or 0.0)
+                + (1 - decay) * elapsed_s
+            )
+            self._control_time_estimated_avg_s = (
+                decay * float(self._control_time_estimated_avg_s or 0.0)
+                + (1 - decay) * estimated_s
+            )
+            self._control_time_delta_avg_s = (
+                decay * float(self._control_time_delta_avg_s or 0.0)
+                + (1 - decay) * delta_s
+            )
+        self._control_time_delta_samples += 1
+        self._control_time_last_delta_s = delta_s
+
+        perf_model_update = getattr(perf_model, "update", None)
+        if callable(perf_model_update):
+            perf_model_update(delta_for_update_s)
+
+        if self.scheduler_config.scheduling_policy == 'atfc':
+            self.atfc_planner.update_perf_model(delta_for_update_s)
+
+    def _record_control_schedule_point(
+        self,
+        schedule_point_s: float,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        estimated_s = self._estimate_control_scheduled_batch_time(
+            scheduler_output,
+        )
+        if estimated_s is None:
+            self.clear_control_timing_anchor()
+            return
+        self._control_time_last_schedule_point_s = float(schedule_point_s)
+        self._control_time_last_estimated_s = estimated_s
             
     def _count_requests_by_tier(
         self,
@@ -860,6 +1114,28 @@ class SchedulerAdmCtrl(SchedulerInterface):
         regular_running, best_effort_running = self._count_requests_by_tier(
             self.running,
         )
+        control_samples = int(getattr(self, "_control_time_delta_samples", 0))
+        control_elapsed_avg_ms = 0.0
+        control_estimated_avg_ms = 0.0
+        control_delta_avg_ms = 0.0
+        control_last_delta_ms = 0.0
+        if control_samples > 0:
+            control_elapsed_avg_ms = (
+                1000.0
+                * float(getattr(self, "_control_time_elapsed_avg_s", 0.0) or 0.0)
+            )
+            control_estimated_avg_ms = (
+                1000.0
+                * float(getattr(self, "_control_time_estimated_avg_s", 0.0) or 0.0)
+            )
+            control_delta_avg_ms = (
+                1000.0
+                * float(getattr(self, "_control_time_delta_avg_s", 0.0) or 0.0)
+            )
+            control_last_delta_ms = (
+                1000.0
+                * float(getattr(self, "_control_time_last_delta_s", 0.0) or 0.0)
+            )
         stats = {
             'num_free_blocks': self.kv_cache_manager.get_num_free_blocks(),
             'effective_num_free_blocks':
@@ -870,8 +1146,14 @@ class SchedulerAdmCtrl(SchedulerInterface):
             'n_regular_running': regular_running,
             'n_best_effort_waitings': best_effort_waiting,
             'n_best_effort_running': best_effort_running,
+            'control_time_elapsed_avg_ms': control_elapsed_avg_ms,
+            'control_time_estimated_avg_ms': control_estimated_avg_ms,
+            'control_time_delta_avg_ms': control_delta_avg_ms,
+            'control_time_delta_last_ms': control_last_delta_ms,
+            'control_time_delta_samples': control_samples,
+            'control_online_slack_ms': 1000.0 * self._get_cpp_online_slack(),
         }
-        stats.update(self._load_stat_counters)
+        stats.update(getattr(self, "_load_stat_counters", {}))
         return stats
 
     def reset(self, profile_events: dict | None = None):
@@ -1009,6 +1291,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        self._clock_monitor_applied_slack_s = 0.0
         authentic_perf_model = self._load_authentic_perf_model()
         self.authentic_perf_model = authentic_perf_model
         self.execution_perf_model = self._build_execution_perf_model(
@@ -1061,6 +1344,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
             "n_arrival_oom_rejects": 0,
             "n_post_admission_oom_rejects": 0,
         }
+        self._reset_control_timing_metrics()
         
         logger.info(f'SchedulerAdmCtrl::reset {self.scheduler_config}, max_num_batched_tokens: {self.max_num_scheduled_tokens}')
         self._maybe_start_clock_monitor()
@@ -1464,13 +1748,14 @@ class SchedulerAdmCtrl(SchedulerInterface):
         for req in promax_reqs:
             req.ddl -= self.scheduled_timestamp
         start_time = time.time()
+        online_slack = self._get_cpp_online_slack()
         is_feasible, is_accepteds = self.slosserve_scheduler.adm_ctrl(
-            promax_reqs, num_free_blocks, 0.0
+            promax_reqs, num_free_blocks, 0.0, online_slack
         )
         accpeted_ids = [req.id for req, accepted in zip(promax_reqs, is_accepteds) if accepted]
         accepted_reqs = [req for req, accepted in zip(promax_reqs, is_accepteds) if accepted]
         is_schedule_feasible, batch_schedules = self.slosserve_scheduler.schedule(
-            accepted_reqs, 0.0, 1, False
+            accepted_reqs, 0.0, 1, False, online_slack
         ) if is_feasible else (False, [])
         is_feasible = is_feasible and is_schedule_feasible
         self._update_exec_plan(batch_schedules=batch_schedules)
@@ -1672,6 +1957,9 @@ class SchedulerAdmCtrl(SchedulerInterface):
         # preempted_reqs: list[Request] = []
         
         self._timer = Timer()
+        long_sched_spans: list[dict[str, Any]] = []
+        control_schedule_point_s = time.time()
+        self._observe_control_timing_delta(control_schedule_point_s)
         
         
         # num_scheduled_tokens: dict[str, int] = {}
@@ -1794,9 +2082,17 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 continue
             if request in admitted_reqs or request in resumed_reqs:
                 if request.num_computed_tokens == 0:
+                    get_computed_blocks_started_at = time.time()
                     new_computed_blocks, num_new_local_computed_tokens = \
                                 self.kv_cache_manager.get_computed_blocks(
                                     request)
+                    self._record_long_sched_span(
+                        long_sched_spans,
+                        "get_computed_blocks",
+                        get_computed_blocks_started_at,
+                        request=request,
+                        num_new_tokens=num_new_tokens,
+                    )
                     self._timer.stop('get_computed_blocks')
                     # print('req', request.request_id, 'num_new_tokens', num_new_tokens, 
                     #       'num_new_local_computed_tokens', num_new_local_computed_tokens)
@@ -1815,6 +2111,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     #     f"request.num_computed_tokens={request.num_computed_tokens}"
                     # )
                     def _allocate_with_prefix_cache() -> Optional[KVCacheBlocks]:
+                        allocate_started_at = time.time()
                         new_blocks = self.kv_cache_manager.allocate_slots(
                             request,
                             num_new_tokens,
@@ -1822,6 +2119,14 @@ class SchedulerAdmCtrl(SchedulerInterface):
                             new_computed_blocks,
                             num_lookahead_tokens=0,
                             delay_cache_blocks=False,
+                        )
+                        self._record_long_sched_span(
+                            long_sched_spans,
+                            "allocate_slots_1",
+                            allocate_started_at,
+                            request=request,
+                            num_new_tokens=num_new_tokens,
+                            num_new_local_computed_tokens=num_new_local_computed_tokens,
                         )
                         self._timer.stop('allocate_slots_1')
                         return new_blocks
@@ -1845,9 +2150,17 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 # KV Xfer request after async KV recvs are completed
                 else:
                     def _allocate_existing_request() -> Optional[KVCacheBlocks]:
+                        allocate_started_at = time.time()
                         new_blocks = self.kv_cache_manager.allocate_slots(
                             request,
                             num_new_tokens
+                        )
+                        self._record_long_sched_span(
+                            long_sched_spans,
+                            "allocate_slots_2",
+                            allocate_started_at,
+                            request=request,
+                            num_new_tokens=num_new_tokens,
                         )
                         self._timer.stop('allocate_slots_2')
                         return new_blocks
@@ -1867,9 +2180,17 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.create_empty_block_list()
                 else:
                     def _allocate_cached_request() -> Optional[KVCacheBlocks]:
+                        allocate_started_at = time.time()
                         new_blocks = self.kv_cache_manager.allocate_slots(
                             request,
                             num_new_tokens
+                        )
+                        self._record_long_sched_span(
+                            long_sched_spans,
+                            "allocate_slots_3",
+                            allocate_started_at,
+                            request=request,
+                            num_new_tokens=num_new_tokens,
                         )
                         self._timer.stop('allocate_slots_3')
                         return new_blocks
@@ -1940,19 +2261,35 @@ class SchedulerAdmCtrl(SchedulerInterface):
             self.kv_cache_config.kv_cache_groups)
         if self.running:
             any_request = self.running[0]
+            common_prefix_started_at = time.time()
             num_common_prefix_blocks = (
                 self.kv_cache_manager.get_num_common_prefix_blocks(
                     any_request, len(self.running)))
+            self._record_long_sched_span(
+                long_sched_spans,
+                "get_num_common_prefix_blocks",
+                common_prefix_started_at,
+                request=any_request,
+                num_running_requests=len(self.running),
+            )
 
         self._timer.stop('get_common_prefix_blocks')
 
         # Construct the scheduler output.
+        new_reqs_data_started_at = time.time()
         new_reqs_data = [
             NewRequestData.from_request(
                 req, req_to_new_blocks[req.request_id].get_block_ids())
             for req in new_requests
         ]
+        self._record_long_sched_span(
+            long_sched_spans,
+            "build_new_reqs_data",
+            new_reqs_data_started_at,
+            num_new_requests=len(new_requests),
+        )
         
+        cached_reqs_data_started_at = time.time()
         cached_reqs_data = self._make_cached_request_data(
             scheduled_running_reqs,
             scheduled_resumed_reqs,
@@ -1960,9 +2297,25 @@ class SchedulerAdmCtrl(SchedulerInterface):
             scheduled_spec_decode_tokens,
             req_to_new_blocks,
         )
+        self._record_long_sched_span(
+            long_sched_spans,
+            "build_cached_reqs_data",
+            cached_reqs_data_started_at,
+            num_running_reqs=len(scheduled_running_reqs),
+            num_resumed_reqs=len(scheduled_resumed_reqs),
+        )
+        grammar_bitmask_started_at = time.time()
         structured_output_request_ids, grammar_bitmask = (
             self.get_grammar_bitmask(self.running,
                                      scheduled_spec_decode_tokens))
+        self._record_long_sched_span(
+            long_sched_spans,
+            "get_grammar_bitmask",
+            grammar_bitmask_started_at,
+            running=len(self.running),
+            structured_output_reqs=len(structured_output_request_ids),
+        )
+        scheduler_output_started_at = time.time()
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1980,6 +2333,13 @@ class SchedulerAdmCtrl(SchedulerInterface):
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
         )
+        self._record_long_sched_span(
+            long_sched_spans,
+            "build_scheduler_output",
+            scheduler_output_started_at,
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
+            num_scheduled_reqs=len(num_scheduled_tokens),
+        )
 
         self._timer.stop('get_scheduler_output')
 
@@ -1988,20 +2348,50 @@ class SchedulerAdmCtrl(SchedulerInterface):
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
         if self.connector is not None:
+            connector_meta_started_at = time.time()
             meta = self.connector.build_connector_meta(scheduler_output)
             scheduler_output.kv_connector_metadata = meta
+            self._record_long_sched_span(
+                long_sched_spans,
+                "build_connector_meta",
+                connector_meta_started_at,
+                num_scheduled_reqs=len(num_scheduled_tokens),
+            )
 
+        kv_events_started_at = time.time()
         events = self.kv_cache_manager.take_events()
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
-            self.kv_event_publisher.publish(batch)        
+            self.kv_event_publisher.publish(batch)
+        self._record_long_sched_span(
+            long_sched_spans,
+            "publish_kv_events",
+            kv_events_started_at,
+            num_events=len(events),
+        )
 
+        update_after_schedule_started_at = time.time()
         self._update_after_schedule(scheduler_output)
+        self._record_long_sched_span(
+            long_sched_spans,
+            "update_after_schedule",
+            update_after_schedule_started_at,
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
+        )
         self._timer.stop('end')
         
-        if self._timer.tot > 0.1:
+        if self._timer.tot > self._long_sched_warn_threshold_s:
             logger.warning(f'LONG SCHEDULING: {self._timer.get()}, time: {self._timer.tot}, # waiting: {len(self.waiting_attainable)}, # running: {len(self.running)}')
-        
+            self._log_long_schedule_details(
+                spans=long_sched_spans,
+                total_num_scheduled_tokens=total_num_scheduled_tokens,
+                num_scheduled_tokens=num_scheduled_tokens,
+            )
+
+        self._record_control_schedule_point(
+            control_schedule_point_s,
+            scheduler_output,
+        )
         return scheduler_output
 
 
@@ -2395,6 +2785,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
             )
 
         return engine_core_outputs
+
 
     def _update_request_with_output(
         self,
