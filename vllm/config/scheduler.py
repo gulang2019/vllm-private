@@ -192,6 +192,9 @@ class SchedulerConfig:
     
     queue_length_threshold: int | None = None
     """The threshold of the queue length."""
+
+    threshold_admission_request_limit: int | None = None
+    """Per-replica request-count limit used by threshold admission."""
     
     max_decoding_length: int | None = None 
     """The maximum decoding length."""

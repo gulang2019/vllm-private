@@ -595,7 +595,10 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 _block_size = self.cache_config.block_size,
                 _max_decode_length = admission_max_decoding_length,
                 _max_batch_size = self.max_num_scheduled_tokens,
-                _is_oracle = self.scheduler_config.oracle_mem
+                _is_oracle = self.scheduler_config.oracle_mem,
+                _threshold_admission_request_limit = (
+                    self.scheduler_config.threshold_admission_request_limit
+                ),
             )
         elif 'vllm' in self.scheduler_config.scheduling_policy:
             self.stateless_schedule_fn = self._schedule_stateless_vllm
@@ -1153,6 +1156,14 @@ class SchedulerAdmCtrl(SchedulerInterface):
             'control_time_delta_samples': control_samples,
             'control_online_slack_ms': 1000.0 * self._get_cpp_online_slack(),
         }
+        if hasattr(self, "atfc_planner"):
+            get_backend_admission_state = getattr(
+                self.atfc_planner,
+                "get_backend_admission_state",
+                None,
+            )
+            if callable(get_backend_admission_state):
+                stats.update(get_backend_admission_state())
         stats.update(getattr(self, "_load_stat_counters", {}))
         return stats
 
@@ -1322,6 +1333,9 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 _max_decode_length = admission_max_decoding_length,
                 _max_batch_size = self.max_num_scheduled_tokens,
                 _is_oracle = self.scheduler_config.oracle_mem,
+                _threshold_admission_request_limit = (
+                    self.scheduler_config.threshold_admission_request_limit
+                ),
                 _profile_events = self._profile_events,
             )
         elif 'vllm' in self.scheduler_config.scheduling_policy:
