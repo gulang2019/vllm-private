@@ -1145,6 +1145,9 @@ class SchedulerAdmCtrl(SchedulerInterface):
             self._get_snapshot_num_free_blocks(),
             'n_waitings': len(self.waiting_attainable) + len(self.waiting_kv_xfer),
             'n_running': len(self.running),
+            'n_waiting_attainable': len(self.waiting_attainable),
+            'n_waiting_kv_xfer': len(self.waiting_kv_xfer),
+            'n_waiting_unattainable': len(self.waiting_unattainable),
             'n_regular_waitings': regular_waiting,
             'n_regular_running': regular_running,
             'n_best_effort_waitings': best_effort_waiting,
@@ -1851,6 +1854,37 @@ class SchedulerAdmCtrl(SchedulerInterface):
             if req.request_id in admitted_req_ids
             or req.request_id in num_scheduled_tokens
         ]
+        regular_waiting_reqs = [
+            req for req in self.waiting_attainable
+            if not req.is_best_effort
+        ]
+        decode_ready_waiting_only = bool(regular_waiting_reqs) and all(
+            int(getattr(req, "num_computed_tokens", 0))
+            >= int(getattr(req, "num_prompt_tokens", 1))
+            for req in regular_waiting_reqs
+        )
+        threshold_admission_enabled = (
+            getattr(
+                getattr(self, "scheduler_config", None),
+                "threshold_admission_request_limit",
+                None,
+            )
+            is not None
+        )
+        if threshold_admission_enabled or decode_ready_waiting_only:
+            admitted_req_ids.update(
+                req.request_id
+                for req in regular_waiting_reqs
+                if req.request_id not in admitted_req_ids
+                and req.request_id not in num_scheduled_tokens
+                and int(getattr(req, "num_computed_tokens", 0))
+                >= int(getattr(req, "num_prompt_tokens", 1))
+            )
+            admitted_reqs = [
+                req for req in self.waiting_attainable
+                if req.request_id in admitted_req_ids
+                or req.request_id in num_scheduled_tokens
+            ]
         resumed_reqs = [
             req for req in self.waiting_unattainable
             if req.request_id in num_scheduled_tokens
@@ -3269,8 +3303,13 @@ class SchedulerAdmCtrl(SchedulerInterface):
         else:
             request_ids = set(request_ids)
 
+        if self.scheduler_config.scheduling_policy == 'atfc':
+            for req_id in request_ids:
+                self.atfc_planner.finish_request(req_id)
+
         running_requests_to_remove = set()
         waiting_requests_to_remove = []
+        waiting_kv_xfer_requests_to_remove = []
         valid_requests = []
 
         # First pass: collect requests to remove from queues
@@ -3283,6 +3322,13 @@ class SchedulerAdmCtrl(SchedulerInterface):
             valid_requests.append(request)
             if request.status == RequestStatus.RUNNING:
                 running_requests_to_remove.add(request)
+            elif request.status == RequestStatus.PREEMPTED:
+                if request in self.running:
+                    running_requests_to_remove.add(request)
+                else:
+                    waiting_requests_to_remove.append(request)
+            elif request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                waiting_kv_xfer_requests_to_remove.append(request)
             elif request.status == RequestStatus.WAITING:
                 waiting_requests_to_remove.append(request)
             else:
@@ -3296,6 +3342,11 @@ class SchedulerAdmCtrl(SchedulerInterface):
             self.running = remove_all(self.running, running_requests_to_remove)
         if waiting_requests_to_remove:
             self.waiting_attainable = remove_all(self.waiting_attainable, waiting_requests_to_remove)
+        if waiting_kv_xfer_requests_to_remove:
+            self.waiting_kv_xfer = remove_all(
+                self.waiting_kv_xfer,
+                waiting_kv_xfer_requests_to_remove,
+            )
 
         # Second pass: set status and free requests
         for request in valid_requests:
@@ -3318,6 +3369,10 @@ class SchedulerAdmCtrl(SchedulerInterface):
             request_ids = (request_ids, )
         else:
             request_ids = set(request_ids)
+
+        if self.scheduler_config.scheduling_policy == 'atfc':
+            for req_id in request_ids:
+                self.atfc_planner.finish_request(req_id)
 
         running_requests_to_remove = set()
         waiting_requests_to_remove = []
