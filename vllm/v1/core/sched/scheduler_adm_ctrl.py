@@ -452,6 +452,9 @@ class SchedulerAdmCtrl(SchedulerInterface):
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
+        self._beam = None
+        self._beam_actuator = None
+        self.sim_gpu = None
         self.log_stats = log_stats
         self.structured_output_manager = structured_output_manager
         self.mm_registry = mm_registry
@@ -566,12 +569,13 @@ class SchedulerAdmCtrl(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        self._configure_beam()
         authentic_perf_model = self._load_authentic_perf_model()
         self.authentic_perf_model = authentic_perf_model
         self.execution_perf_model = self._build_execution_perf_model(
             authentic_perf_model)
         self.perf_model = self._build_control_perf_model(authentic_perf_model)
-        self.slosserve_scheduler = SLOsServe_C.AdmCtrlScheduler(self.scheduler_config.scheduling_policy, self.block_size, False, False)
+        self.slosserve_scheduler = SLOsServe_C.AdmCtrlScheduler('atfc' if self._uses_atfc() else 'vllm' if self.scheduler_config.scheduling_policy == 'beam' else self.scheduler_config.scheduling_policy, self.block_size, False, False)
         self.perf_model.configure_cpp_ar_planner(
             self.slosserve_scheduler,
             tpots=[self.get_tpot_slo()],
@@ -581,7 +585,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         self._log_perf_model_configuration()
         if self.scheduler_config.scheduling_policy in ["dp", "edf"]:
             self.stateless_schedule_fn = self._schedule_stateless_slosserve
-        elif self.scheduler_config.scheduling_policy == 'atfc':
+        elif self._uses_atfc():
             self.stateless_schedule_fn = self._schedule_stateless_atfc
             admission_max_decoding_length = (
                 self.scheduler_config.admission_max_decoding_length
@@ -595,11 +599,16 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 _block_size = self.cache_config.block_size,
                 _max_decode_length = admission_max_decoding_length,
                 _max_batch_size = self.max_num_scheduled_tokens,
+                _admission_max_batch_size=(self.max_num_scheduled_tokens
+                    if self.scheduler_config.scheduling_policy == "beam_atfc"
+                    else None),
                 _is_oracle = self.scheduler_config.oracle_mem,
                 _threshold_admission_request_limit = (
                     self.scheduler_config.threshold_admission_request_limit
                 ),
             )
+        elif self.scheduler_config.scheduling_policy == 'beam':
+            self.stateless_schedule_fn = self._schedule_stateless_beam
         elif 'vllm' in self.scheduler_config.scheduling_policy:
             self.stateless_schedule_fn = self._schedule_stateless_vllm
         else:
@@ -636,10 +645,185 @@ class SchedulerAdmCtrl(SchedulerInterface):
     def _load_authentic_perf_model(self):
         from SLOsServe.perf_model import PerfModel
 
+        cfg = self.scheduler_config
+        clock = getattr(cfg, "mock_profile_clock_mhz", None)
+        if clock is not None and cfg.beam_backend == "mock":
+            from SLOsServe.beam import BeamProfile
+            path = cfg.beam_profile_path or os.getenv("SLOSSERVE_BEAM_PROFILE")
+            if not path:
+                raise ValueError("mock_profile_clock_mhz requires beam_profile_path")
+            profile = BeamProfile(path)
+            return PerfModel(cfg.model_name, profile.fit_perf_model_params(
+                int(clock), prefill_overhead_s=cfg.beam_prefill_overhead_s,
+                decode_overhead_s=cfg.beam_decode_overhead_s))
+
         return PerfModel.get_perf_model(
             self.scheduler_config.model_name,
             self.scheduler_config.length_pattern,
         )
+
+    def _uses_atfc(self) -> bool:
+        return self.scheduler_config.scheduling_policy in ("atfc", "beam_atfc")
+
+    def _configure_beam(self) -> None:
+        """Set up BEAM and, for mock engines, the profiled GPU.
+
+        With beam/beam_atfc, or with mock_profile_clock_mhz on a mock
+        engine, the BEAM profile is the simulated machine for the run:
+        self.sim_gpu executes every batch and reports its energy.
+        """
+        self._close_beam()
+        cfg = self.scheduler_config
+        policy = cfg.scheduling_policy
+        uses_beam = policy in ("beam", "beam_atfc")
+        if cfg.beam_backend not in ("real", "mock"):
+            raise ValueError("beam_backend must be real or mock")
+        mock = (cfg.beam_backend == "mock"
+                or self.vllm_config.is_simulation in ("logical", "emulate"))
+        fixed_clock = cfg.mock_profile_clock_mhz if mock else None
+        if not uses_beam and fixed_clock is None:
+            return
+        from SLOsServe.beam import (BeamProfile, BeamScheduler, NvmlClock,
+                                    SimulatedGpu)
+        if uses_beam and (self.parallel_config.tensor_parallel_size != 1
+                          or self.parallel_config.pipeline_parallel_size != 1):
+            raise ValueError("BEAM integration currently requires TP=1, PP=1")
+        path = cfg.beam_profile_path or os.getenv("SLOSSERVE_BEAM_PROFILE")
+        if not path:
+            raise ValueError("beam/beam_atfc and mock_profile_clock_mhz require "
+                             "beam_profile_path or SLOSSERVE_BEAM_PROFILE")
+        profile = BeamProfile(path)
+        if mock:
+            # An unlocked GPU runs at its boost clock until BEAM locks one.
+            self.sim_gpu = SimulatedGpu(
+                profile,
+                clock=(profile.default_clock_high if uses_beam
+                       else int(fixed_clock)),
+                switch_delay_s=cfg.beam_switch_delay_s,
+                prefill_overhead_s=cfg.beam_prefill_overhead_s,
+                decode_overhead_s=cfg.beam_decode_overhead_s)
+        if not uses_beam:
+            return
+        if mock:
+            self._beam_actuator = self.sim_gpu
+        else:
+            device = cfg.beam_device_id
+            if device is None:
+                if self.parallel_config.data_parallel_size != 1:
+                    raise ValueError("Set beam_device_id for each DP engine")
+                device = 0
+            physical = current_platform.device_id_to_physical_device_id(device)
+            self._beam_actuator = NvmlClock(physical)
+        self._beam_atfc_clock = None
+        # Upstream starts from vLLM's max_num_batched_tokens (8192 on an
+        # 80GB A100); the profile has no ground truth past its largest batch.
+        self.max_num_scheduled_tokens = min(
+            cfg.max_num_batched_tokens, profile.batch_sizes[-1])
+        if self.max_num_scheduled_tokens < min(profile.chunk_sizes):
+            raise ValueError("max_num_batched_tokens is below BEAM S1 coverage")
+        if policy == "beam":
+            # The initial timestamp is never compared: last_prefill_ttft is 0.
+            self._beam = BeamScheduler(
+                profile, self._beam_actuator, now=0.0,
+                initial_chunk=self.max_num_scheduled_tokens,
+                use_s1=cfg.beam_use_s1, use_s2=cfg.beam_use_s2,
+                use_s1_dvfs_only=cfg.beam_use_s1_dvfs_only)
+        self._beam_profile = profile
+        if policy == "beam":
+            cfg.allow_rejection = False
+            cfg.enable_admission = False
+            cfg.queue_length_threshold = None
+            cfg.enable_chunked_prefill = True
+            cfg.chunked_prefill_enabled = True
+            cfg.long_prefill_token_threshold = 0
+
+    def _close_beam(self) -> None:
+        actuator = getattr(self, "_beam_actuator", None)
+        if actuator is not None and hasattr(actuator, "close"):
+            actuator.close()
+        self._beam = None
+        self._beam_actuator = None
+        self._beam_profile = None
+        self.sim_gpu = None
+
+    def _schedule_stateless_beam(self):
+        # Upstream vLLM v1 order: RUNNING in admission order, then WAITING
+        # FCFS; S1's chunk size bounds the whole batch, decodes included.
+        self.max_num_scheduled_tokens = self._beam.max_num_scheduled_tokens
+        return self._schedule_stateless_vllm()
+
+    def _beam_after_schedule(self, scheduled: dict[str, int]) -> None:
+        """Runs where upstream's schedule() ends, before num_computed_tokens
+        advances."""
+        if self._beam is not None:
+            self._beam_s1_s2(scheduled)
+        elif self._beam_actuator is not None and any(scheduled.values()):
+            self._beam_atfc_clock_for_batch(scheduled)
+
+    def _log_beam_decision(self, decision: dict) -> None:
+        decision.update(
+            policy=self.scheduler_config.scheduling_policy,
+            backend="mock" if self.sim_gpu is not None else "real",
+            profile=self._beam_profile.path)
+        self._profile_events.append({"event_type": "beam_decision",
+                                     "timestamp": self.current_time(),
+                                     "extra_args": decision})
+
+    def _beam_s1_s2(self, scheduled: dict[str, int]) -> None:
+        from SLOsServe.beam import PrefillRequest
+        now = self.current_time()
+        prefill_requests = []
+        prefill_unfinished_tokens = 0
+        for request_id, num_tokens in scheduled.items():
+            request = self.requests[request_id]
+            if request.num_computed_tokens < request.num_prompt_tokens:
+                prefill_unfinished_tokens += num_tokens
+            if num_tokens > 1:
+                prefill_requests.append(PrefillRequest(
+                    queuing_time_s=now - request.arrival_time,
+                    ttft_budget_s=self._get_prefill_ddl(request) - now))
+        pending = [r for r in (self.running + self.waiting_attainable
+                               + self.waiting_unattainable)
+                   if r.num_computed_tokens < r.num_prompt_tokens]
+        idle_ttft_budget = min(
+            (self._get_prefill_ddl(r) - r.arrival_time for r in pending),
+            default=math.inf)
+        for decision in self._beam.after_schedule(
+                prefill_unfinished_tokens=prefill_unfinished_tokens,
+                has_prefill_requests=bool(prefill_requests),
+                prefill_requests=prefill_requests,
+                idle_ttft_budget=idle_ttft_budget,
+                num_running=len(self.running),
+                total_ctx_len=sum(r.num_tokens_with_spec for r in self.running),
+                tbt_slo=self.get_tpot_slo(), now=now):
+            self._log_beam_decision(decision)
+
+    def _beam_atfc_clock_for_batch(self, scheduled: dict[str, int]) -> None:
+        """beam_atfc (not upstream BEAM): keep ATFC's batch, then pick the
+        cheapest clock that BEAM's model says fits ATFC's batch-time plan."""
+        from SLOsServe.beam import cheapest_clock_within
+        now = self.current_time()
+        batch = [(self.requests[rid].num_computed_tokens, n)
+                 for rid, n in scheduled.items() if n > 0]
+        prefills = [self.requests[rid] for rid, n in scheduled.items()
+                    if n > 0 and self.requests[rid].num_computed_tokens
+                    < self.requests[rid].num_prompt_tokens]
+        budget = self.get_tpot_slo()
+        if prefills:
+            budget = min(budget, min(self._get_prefill_ddl(r)
+                                    for r in prefills) - now)
+        budget = min(budget, self.atfc_planner._perf_model.get_batch_time(batch))
+        clock, feasible = cheapest_clock_within(
+            self._beam_profile, tokens=sum(n for _, n in batch),
+            total_ctx_len=sum(c for c, _ in batch),
+            has_prefill=any(n > 1 for _, n in batch), budget_s=budget)
+        applied = clock != self._beam_atfc_clock
+        if applied:
+            self._beam_actuator.set_clock(clock, now)
+            self._beam_atfc_clock = clock
+        self._log_beam_decision({"phase": "batch", "clock_mhz": clock,
+                                 "feasible": feasible, "budget_s": budget,
+                                 "applied": applied})
 
     def _long_sched_value(self, value: Any) -> Any:
         if isinstance(value, Request):
@@ -1078,7 +1262,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         if callable(perf_model_update):
             perf_model_update(delta_for_update_s)
 
-        if self.scheduler_config.scheduling_policy == 'atfc':
+        if self._uses_atfc():
             self.atfc_planner.update_perf_model(delta_for_update_s)
 
     def _record_control_schedule_point(
@@ -1172,6 +1356,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
 
     def reset(self, profile_events: dict | None = None):
         logger.info('SchedulerAdmCtrl::reset')
+        self._close_beam()
         self._stop_clock_monitor()
         self._clock_monitor_config = self._load_clock_monitor_config()
         self._clock_monitor_state = GpuClockMonitorState(
@@ -1198,7 +1383,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         # request ids should be included in the EngineCoreOutputs returned
         # by update_from_outputs(). This is currently used in the multi-engine
         # case to track request lifetimes efficiently.
-        self._profile_events = profile_events
+        self._profile_events = profile_events if profile_events is not None else []
         self.finished_req_ids_dict: Optional[dict[int, set[str]]] = (
             defaultdict(set) if self.include_finished_set else None)
 
@@ -1305,13 +1490,14 @@ class SchedulerAdmCtrl(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        self._configure_beam()
         self._clock_monitor_applied_slack_s = 0.0
         authentic_perf_model = self._load_authentic_perf_model()
         self.authentic_perf_model = authentic_perf_model
         self.execution_perf_model = self._build_execution_perf_model(
             authentic_perf_model)
         self.perf_model = self._build_control_perf_model(authentic_perf_model)
-        self.slosserve_scheduler = SLOsServe_C.AdmCtrlScheduler(self.scheduler_config.scheduling_policy, self.block_size, False, False)
+        self.slosserve_scheduler = SLOsServe_C.AdmCtrlScheduler('atfc' if self._uses_atfc() else 'vllm' if self.scheduler_config.scheduling_policy == 'beam' else self.scheduler_config.scheduling_policy, self.block_size, False, False)
         self.perf_model.configure_cpp_ar_planner(
             self.slosserve_scheduler,
             tpots=[self.get_tpot_slo()],
@@ -1321,7 +1507,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         self._log_perf_model_configuration()
         if self.scheduler_config.scheduling_policy in ["dp", "edf"]:
             self.stateless_schedule_fn = self._schedule_stateless_slosserve
-        elif self.scheduler_config.scheduling_policy == 'atfc':
+        elif self._uses_atfc():
             self.stateless_schedule_fn = self._schedule_stateless_atfc
             admission_max_decoding_length = (
                 self.scheduler_config.admission_max_decoding_length
@@ -1335,12 +1521,17 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 _block_size = self.cache_config.block_size,
                 _max_decode_length = admission_max_decoding_length,
                 _max_batch_size = self.max_num_scheduled_tokens,
+                _admission_max_batch_size=(self.max_num_scheduled_tokens
+                    if self.scheduler_config.scheduling_policy == "beam_atfc"
+                    else None),
                 _is_oracle = self.scheduler_config.oracle_mem,
                 _threshold_admission_request_limit = (
                     self.scheduler_config.threshold_admission_request_limit
                 ),
                 _profile_events = self._profile_events,
             )
+        elif self.scheduler_config.scheduling_policy == 'beam':
+            self.stateless_schedule_fn = self._schedule_stateless_beam
         elif 'vllm' in self.scheduler_config.scheduling_policy:
             self.stateless_schedule_fn = self._schedule_stateless_vllm
         else:
@@ -1527,7 +1718,9 @@ class SchedulerAdmCtrl(SchedulerInterface):
         #     self.waiting_attainable = sorted(self.waiting_attainable,\
         #         key= lambda r: r.sampling_params.extra_args['slo_ttft'] + r.arrival_time)
         
-        if 'sarathi' in self.scheduler_config.scheduling_policy:
+        if self.scheduler_config.scheduling_policy == 'beam':
+            self.waiting_attainable.sort(key=lambda r: r.arrival_time)
+        elif 'sarathi' in self.scheduler_config.scheduling_policy:
             # prioritize decode requests
             self.waiting_attainable = sorted(self.waiting_attainable,\
                 key= lambda r: r.num_prompt_tokens - r.num_computed_tokens)
@@ -2040,7 +2233,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 "timestamp": time.time(),
             })
             
-            if self.scheduler_config.scheduling_policy == 'atfc':
+            if self._uses_atfc():
                 self.atfc_planner.request_arrive(request.request_id)
             
             self.waiting_kv_xfer.remove(request)
@@ -2264,7 +2457,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     request.request_id,
                 )
                 self.reject_requests(request.request_id)
-                if self.scheduler_config.scheduling_policy == 'atfc':
+                if self._uses_atfc():
                     self.atfc_planner.finish_request(request.request_id)
                 self._profile_events.append({
                     "event_type": "finish",
@@ -2322,6 +2515,8 @@ class SchedulerAdmCtrl(SchedulerInterface):
             )
 
         self._timer.stop('get_common_prefix_blocks')
+
+        self._beam_after_schedule(num_scheduled_tokens)
 
         # Construct the scheduler output.
         new_reqs_data_started_at = time.time()
@@ -2825,7 +3020,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
-        if self.scheduler_config.scheduling_policy == 'atfc':
+        if self._uses_atfc():
             self.atfc_planner.commit_batch(
                 num_scheduled_tokens = scheduler_output.num_scheduled_tokens,
                 finished_reqs = [req.request_id for req in stopped_reqs],
@@ -3049,7 +3244,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
             },
         })
         self.reject_requests(request_id)
-        if self.scheduler_config.scheduling_policy == 'atfc':
+        if self._uses_atfc():
             self.atfc_planner.finish_request(request_id)
         self._prune_requests_from_schedule_state(
             {request_id},
@@ -3150,7 +3345,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
             }
         })
         timer.stop('get_num_new_matched_tokens')
-        if self.scheduler_config.scheduling_policy == 'atfc':
+        if self._uses_atfc():
             if self.scheduler_config.admission_mode == "off":
                 feasible = True
             else:
@@ -3227,7 +3422,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
                     "timestamp": time.time(),
                     "finish_reason": "rejected-oom",
                 })
-                if self.scheduler_config.scheduling_policy == 'atfc':
+                if self._uses_atfc():
                     self.atfc_planner.finish_request(request.request_id)
                 timer.stop('finish_requests')
                 timer.display(thresh = 0.1, label = 'LONGMEM')
@@ -3283,6 +3478,8 @@ class SchedulerAdmCtrl(SchedulerInterface):
             request.status = RequestStatus.WAITING
         
         self.requests[request.request_id] = request
+        if self._beam is not None:
+            self._beam.add_request(request.num_prompt_tokens)
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
         timer.stop('END')
@@ -3303,7 +3500,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         else:
             request_ids = set(request_ids)
 
-        if self.scheduler_config.scheduling_policy == 'atfc':
+        if self._uses_atfc():
             for req_id in request_ids:
                 self.atfc_planner.finish_request(req_id)
 
@@ -3370,7 +3567,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         else:
             request_ids = set(request_ids)
 
-        if self.scheduler_config.scheduling_policy == 'atfc':
+        if self._uses_atfc():
             for req_id in request_ids:
                 self.atfc_planner.finish_request(req_id)
 
@@ -3480,6 +3677,7 @@ class SchedulerAdmCtrl(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
+        self._close_beam()
         self._stop_clock_monitor()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()

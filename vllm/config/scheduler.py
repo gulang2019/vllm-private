@@ -247,6 +247,27 @@ class SchedulerConfig:
     clock_monitor_enabled: bool | None = None
     """Override the vLLM clock-throttling monitor toggle when set."""
 
+    beam_profile_path: str | None = None
+    """BEAM CSV profile; defaults to SLOSSERVE_BEAM_PROFILE in the engine."""
+    mock_profile_clock_mhz: int | None = None
+    """Mock engines: simulate the BEAM profile's GPU; non-BEAM policies run
+    locked at this clock and plan with a model fitted to it."""
+    beam_backend: str = "real"
+    """Clock actuator backend. MockEngineWorker always forces 'mock'."""
+    beam_device_id: int | None = None
+    """Visible CUDA device index owned by this engine (required for multi-DP)."""
+    beam_use_s1: bool = True
+    beam_use_s2: bool = True
+    beam_use_s1_dvfs_only: bool = False
+    """BEAM's --use-s1, --use-s2 and --use-s1-dvfs-only (chunk fixed at 256)."""
+    beam_prefill_overhead_s: float = 0.012
+    beam_decode_overhead_s: float = 0.003
+    """Simulated per-step overhead of a mock profiled GPU, by batch kind."""
+    beam_switch_delay_s: float = 0.010
+    """Simulated delay before a requested clock takes effect."""
+    mock_idle_power_w: float = 70.0
+    """Simulated idle board power of a mock profiled GPU (not profiled)."""
+
     clock_monitor_interval_s: float | None = None
     """Polling interval for the scheduler-side GPU clock monitor."""
 
