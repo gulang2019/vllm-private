@@ -260,6 +260,10 @@ class SchedulerConfig:
     beam_use_s2: bool = True
     beam_use_s1_dvfs_only: bool = False
     """BEAM's --use-s1, --use-s2 and --use-s1-dvfs-only (chunk fixed at 256)."""
+    beam_discount_cached_prefill: bool = True
+    """Remove prefix-cache hits from BEAM's pending prefill tokens. False keeps
+    upstream's counter, which never drains cached tokens (upstream BEAM runs
+    with prefix caching off)."""
     beam_prefill_overhead_s: float = 0.012
     beam_decode_overhead_s: float = 0.003
     """Simulated per-step overhead of a mock profiled GPU, by batch kind."""

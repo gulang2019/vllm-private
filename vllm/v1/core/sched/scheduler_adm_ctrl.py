@@ -16,6 +16,7 @@ import json
 import bisect
 import copy
 import os
+import re
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
@@ -685,13 +686,18 @@ class SchedulerAdmCtrl(SchedulerInterface):
             return
         from SLOsServe.beam import (BeamProfile, BeamScheduler, NvmlClock,
                                     SimulatedGpu)
-        if uses_beam and (self.parallel_config.tensor_parallel_size != 1
-                          or self.parallel_config.pipeline_parallel_size != 1):
-            raise ValueError("BEAM integration currently requires TP=1, PP=1")
+        tp_size = self.parallel_config.tensor_parallel_size
+        if uses_beam and self.parallel_config.pipeline_parallel_size != 1:
+            raise ValueError("BEAM integration currently requires PP=1")
         path = cfg.beam_profile_path or os.getenv("SLOSSERVE_BEAM_PROFILE")
         if not path:
             raise ValueError("beam/beam_atfc and mock_profile_clock_mhz require "
                              "beam_profile_path or SLOSSERVE_BEAM_PROFILE")
+        # The profile times one server; it must be measured at this TP.
+        profile_tp = re.search(r"_tp(\d+)_pp\d+", os.path.basename(path))
+        if profile_tp and int(profile_tp.group(1)) != tp_size:
+            raise ValueError(f"BEAM profile {path} is for TP={profile_tp.group(1)}, "
+                             f"this engine runs TP={tp_size}")
         profile = BeamProfile(path)
         if mock:
             # An unlocked GPU runs at its boost clock until BEAM locks one.
@@ -712,9 +718,12 @@ class SchedulerAdmCtrl(SchedulerInterface):
                 if self.parallel_config.data_parallel_size != 1:
                     raise ValueError("Set beam_device_id for each DP engine")
                 device = 0
-            physical = current_platform.device_id_to_physical_device_id(device)
-            self._beam_actuator = NvmlClock(physical)
+            # Upstream apply_dvfs locks all tp*pp ranks of the server.
+            self._beam_actuator = NvmlClock([
+                current_platform.device_id_to_physical_device_id(device + rank)
+                for rank in range(tp_size)])
         self._beam_atfc_clock = None
+        self._beam_arrivals: set[str] = set()
         # Upstream starts from vLLM's max_num_batched_tokens (8192 on an
         # 80GB A100); the profile has no ground truth past its largest batch.
         self.max_num_scheduled_tokens = min(
@@ -776,7 +785,9 @@ class SchedulerAdmCtrl(SchedulerInterface):
         prefill_unfinished_tokens = 0
         for request_id, num_tokens in scheduled.items():
             request = self.requests[request_id]
-            if request.num_computed_tokens < request.num_prompt_tokens:
+            # Decode stages were never BEAM arrivals (see add_request).
+            counted = request_id in self._beam_arrivals
+            if counted and request.num_computed_tokens < request.num_prompt_tokens:
                 prefill_unfinished_tokens += num_tokens
             if num_tokens > 1:
                 prefill_requests.append(PrefillRequest(
@@ -3296,6 +3307,13 @@ class SchedulerAdmCtrl(SchedulerInterface):
 
     def add_request(self, request: Request) -> bool:
         timer = Timer()
+        # The router sends each request twice: a prefill stage, then a decode
+        # stage whose KV arrives through the connector (on the same engine it
+        # reuses the request below). Upstream sees one arrival per request.
+        beam_arrival = (self._beam is not None
+                        and request.request_id not in self.requests
+                        and not (request.kv_transfer_params or {}).get(
+                            'do_remote_prefill'))
         if request.request_id in self.requests:
             # logger.info(f"Received request {request.request_id} that is already in the scheduler, finishing the request sending on local server")
             # logger.info(f"New: {request}")
@@ -3478,8 +3496,15 @@ class SchedulerAdmCtrl(SchedulerInterface):
             request.status = RequestStatus.WAITING
         
         self.requests[request.request_id] = request
-        if self._beam is not None:
-            self._beam.add_request(request.num_prompt_tokens)
+        if beam_arrival:
+            self._beam_arrivals.add(request.request_id)
+            # Upstream counts the whole prompt as pending prefill and drains
+            # only computed tokens, so prefix-cache hits would stay pending
+            # forever (upstream runs without prefix caching).
+            self._beam.add_request(
+                request.num_prompt_tokens - num_new_local_computed_tokens
+                if self.scheduler_config.beam_discount_cached_prefill
+                else request.num_prompt_tokens)
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
         timer.stop('END')
