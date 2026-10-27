@@ -732,11 +732,17 @@ class SchedulerAdmCtrl(SchedulerInterface):
             raise ValueError("max_num_batched_tokens is below BEAM S1 coverage")
         if policy == "beam":
             # The initial timestamp is never compared: last_prefill_ttft is 0.
+            # SLOSSERVE_BEAM_FALLBACK_CHUNK (not upstream) replaces the
+            # 128/256 chunk S1 falls back to when no plan meets both SLOs.
+            fallback_chunk = os.getenv("SLOSSERVE_BEAM_FALLBACK_CHUNK")
             self._beam = BeamScheduler(
                 profile, self._beam_actuator, now=0.0,
                 initial_chunk=self.max_num_scheduled_tokens,
                 use_s1=cfg.beam_use_s1, use_s2=cfg.beam_use_s2,
-                use_s1_dvfs_only=cfg.beam_use_s1_dvfs_only)
+                use_s1_dvfs_only=cfg.beam_use_s1_dvfs_only,
+                fallback_chunk=int(fallback_chunk) if fallback_chunk else None)
+            logger.info("BEAM S1 fallback chunk: %s",
+                        fallback_chunk or "upstream (128/256)")
         self._beam_profile = profile
         if policy == "beam":
             cfg.allow_rejection = False
